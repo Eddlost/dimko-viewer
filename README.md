@@ -37,7 +37,18 @@ The result is exact: measure a 2 m box edge and you get `2.000 m`, not
 - Element properties including IFC property sets
 - **Distance** and **polyline** measurement with vertex/edge snapping
 - Section planes cut from any clicked face
-- Measurements persist in `localStorage` between sessions
+- Models, measurements and camera settings survive a reload
+
+## Where your files go
+
+Nowhere. There is no account, no upload and no server — the model is parsed by
+WebAssembly in your own browser.
+
+To save you re-opening files after every reload, loaded models are kept in the
+browser's IndexedDB on your machine (IFC in its parsed form, so reopening is
+fast). Measurements and camera preferences go to `localStorage`. **Reset** in
+the toolbar clears all of it, and removing a single model deletes its copy too.
+Nothing is written until you actually open a model.
 
 ## Run it
 
@@ -70,9 +81,11 @@ src/features/viewer/
   objModel.ts      OBJ parsing into three.js meshes with stable part ids
   visibility.ts    visibility snapshot logic (unit-tested)
   CameraPanel.tsx  projection + field-of-view controls
-src/features/models/        structure tree
+src/features/models/        structure tree, restore on startup
 src/features/properties/    property panel + property index
 src/features/measurements/  measurement list, localStorage persistence
+src/lib/modelStore.ts       IndexedDB store for loaded models
+src/lib/cameraSettings.ts   remembered projection + field of view
 ```
 
 Two rendering paths coexist. IFC goes through

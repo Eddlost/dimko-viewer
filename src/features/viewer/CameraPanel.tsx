@@ -1,5 +1,9 @@
 import { useViewerContext } from "./ViewerContext";
-import { DEFAULT_FOV, MAX_FOV, MIN_FOV } from "./useViewer";
+import {
+  DEFAULT_CAMERA_SETTINGS,
+  MAX_FOV,
+  MIN_FOV,
+} from "../../lib/cameraSettings";
 
 /**
  * Field-of-view presets. 60°+ is a wide-angle lens: fine for games, wrong for
@@ -7,7 +11,11 @@ import { DEFAULT_FOV, MAX_FOV, MIN_FOV } from "./useViewer";
  */
 const FOV_PRESETS = [
   { value: 25, label: "25°", hint: "Telephoto — almost no distortion" },
-  { value: DEFAULT_FOV, label: "35°", hint: "Default — natural for buildings" },
+  {
+    value: DEFAULT_CAMERA_SETTINGS.fov,
+    label: "35°",
+    hint: "Default — natural for buildings",
+  },
   { value: 50, label: "50°", hint: "Wide — more of the scene, more stretch" },
 ];
 

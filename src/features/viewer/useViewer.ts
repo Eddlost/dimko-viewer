@@ -25,6 +25,13 @@ import {
   type ClipPlanes,
 } from "./screenScale";
 import {
+  loadCameraSettings,
+  saveCameraSettings,
+  MAX_FOV,
+  MIN_FOV,
+  type Projection,
+} from "../../lib/cameraSettings";
+import {
   disposeMeshModel,
   meshModelsBounds,
   parseObj,
@@ -53,16 +60,7 @@ export type LoadedModel = {
 /** Screen-space radius, in CSS pixels, within which an OBJ vertex snaps. */
 const MESH_SNAP_RADIUS_PX = 14;
 
-export type Projection = "perspective" | "orthographic";
-
-/**
- * Vertical field of view. The library default of 60° is a wide-angle lens:
- * usable for games, wrong for inspecting a building, where it visibly stretches
- * anything away from the frame centre. Architectural viewers sit around 35–45°.
- */
-export const DEFAULT_FOV = 35;
-export const MIN_FOV = 15;
-export const MAX_FOV = 80;
+export type { Projection } from "../../lib/cameraSettings";
 
 // Result of a snap-aware pick: world point (snapped to a vertex when one is
 // in range, else the raw surface hit), the element it belongs to, and whether
@@ -210,8 +208,10 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const meshModelsRef = useRef<Map<string, MeshModel>>(new Map());
   // Set by the bootstrap effect so loaders outside it can refresh the list.
   const syncModelsRef = useRef<(() => void) | null>(null);
-  // Camera settings survive a projection swap, which replaces `camera.three`.
-  const fovRef = useRef(DEFAULT_FOV);
+  // Camera settings survive a projection swap, which replaces `camera.three`,
+  // and a reload (localStorage).
+  const initialCameraRef = useRef(loadCameraSettings());
+  const fovRef = useRef(initialCameraRef.current.fov);
   const clipPlanesRef = useRef<ClipPlanes>(
     clipPlanesForDiagonal(DEFAULT_SCENE_DIAGONAL),
   );
@@ -243,8 +243,10 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     points: Array<[number, number, number]>;
     elements?: Array<{ modelId: string; localId: number }>;
   } | null>(null);
-  const [projection, setProjectionState] = useState<Projection>("perspective");
-  const [fov, setFovState] = useState(DEFAULT_FOV);
+  const [projection, setProjectionState] = useState<Projection>(
+    initialCameraRef.current.projection,
+  );
+  const [fov, setFovState] = useState(initialCameraRef.current.fov);
   const [showAllVersion, setShowAllVersion] = useState(0);
   // Active drag-select rectangle (canvas pixel coords). When non-null,
   // Viewport renders an overlay outline. The mouseup handler clears it.
@@ -332,6 +334,22 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       world.scene.three.background = new THREE.Color(0x171717);
       world.camera.controls.setLookAt(12, 8, 12, 0, 0, 0);
       applyCameraSettings(world, fovRef.current, clipPlanesRef.current);
+
+      // The camera starts perspective; honour the remembered projection.
+      if (initialCameraRef.current.projection === "orthographic") {
+        try {
+          await (world.camera as any).projection?.set?.("Orthographic");
+        } catch (e) {
+          console.warn("[viewer] initial projection swap failed", e);
+        }
+        if (disposed) {
+          components.dispose();
+          return;
+        }
+        // The swap happens before onProjectionChanged is subscribed below, so
+        // the fresh camera would keep the library's near/far otherwise.
+        applyCameraSettings(world, fovRef.current, clipPlanesRef.current);
+      }
 
       const grids = components.get(OBC.Grids);
       grids.create(world);
@@ -2468,6 +2486,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     if (fragments?.initialized) fragments.core.update(true);
   }, []);
 
+  // Remember how the user likes to look at models.
+  useEffect(() => {
+    saveCameraSettings({ projection, fov });
+  }, [projection, fov]);
+
   const setProjection = useCallback(async (mode: Projection) => {
     const world = worldRef.current;
     const proj: any = (world?.camera as any)?.projection;
@@ -2862,8 +2885,15 @@ function applyCameraSettings(world: any, fov: number, planes: ClipPlanes) {
   const camera = world?.camera?.three as THREE.Camera | undefined;
   if (!camera) return;
   const perspective = camera as THREE.PerspectiveCamera;
-  if (perspective.isPerspectiveCamera) perspective.fov = fov;
-  (camera as THREE.PerspectiveCamera).near = planes.near;
+  if (perspective.isPerspectiveCamera) {
+    perspective.fov = fov;
+    perspective.near = planes.near;
+  } else {
+    // Orthographic has no vanishing point, so the camera can end up sitting
+    // inside the model with half of it behind the lens. A near plane behind
+    // the camera keeps that half visible instead of slicing it off.
+    (camera as THREE.OrthographicCamera).near = -planes.far;
+  }
   (camera as THREE.PerspectiveCamera).far = planes.far;
   (camera as any).updateProjectionMatrix?.();
 

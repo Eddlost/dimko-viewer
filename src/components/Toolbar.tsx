@@ -2,6 +2,7 @@ import { useRef } from "react";
 import { useViewerContext } from "../features/viewer/ViewerContext";
 import { useModelImport } from "../features/viewer/useModelImport";
 import { useMeasurements } from "../features/measurements/MeasurementsContext";
+import { clearModels } from "../lib/modelStore";
 import { ACCEPTED_EXTENSIONS } from "../lib/fileImport";
 
 type ButtonProps = {
@@ -138,11 +139,12 @@ export function Toolbar() {
         label="Reset"
         icon="⌫"
         disabled={!hasModels}
-        title="Remove all models and measurements from the scene"
+        title="Remove all models and measurements, here and from browser storage"
         onClick={() => {
           clear();
           clearMeasurements();
           deleteAllClips();
+          void clearModels();
         }}
       />
     </div>

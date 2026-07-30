@@ -5,6 +5,7 @@ import { ViewerProvider } from "./features/viewer/ViewerContext";
 import { ContextMenuProvider } from "./components/ContextMenu";
 import { Toolbar } from "./components/Toolbar";
 import { ModelsPanel } from "./features/models/ModelsPanel";
+import { RestoreModels } from "./features/models/RestoreModels";
 import { PropertiesPanel } from "./features/properties/PropertiesPanel";
 import { MeasurementsPanel } from "./features/measurements/MeasurementsPanel";
 import { MeasurementsProvider } from "./features/measurements/MeasurementsContext";
@@ -66,6 +67,7 @@ export default function App() {
     <ViewerProvider>
       <MeasurementsProvider>
         <ContextMenuProvider>
+          <RestoreModels />
           <div className="flex flex-col h-screen w-screen overflow-hidden bg-(--color-bg)">
             <Header />
             <div className="flex flex-1 overflow-hidden">

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as OBC from "@thatopen/components";
 import { useViewerContext } from "../viewer/ViewerContext";
 import { CameraPanel } from "../viewer/CameraPanel";
+import { deleteModel as deleteStoredModel } from "../../lib/modelStore";
 import type { LoadedModel } from "../viewer/useViewer";
 
 type Group = { name: string; items: OBC.ModelIdMap };
@@ -115,7 +116,11 @@ function ModelBlock({ model }: { model: LoadedModel }) {
         </span>
         <button
           type="button"
-          onClick={() => removeModel(model.id)}
+          onClick={async () => {
+            await removeModel(model.id);
+            // Drop it from storage too, or it returns on the next reload.
+            await deleteStoredModel(model.id);
+          }}
           title="Remove model"
           className="text-(--color-text-mute) hover:text-(--color-danger) text-xs"
         >
