@@ -523,6 +523,22 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         // shift+left-drag past threshold = rectangle select
         selecting: false as boolean,
         additive: false as boolean,
+        // press landed on a section plane's drag gizmo — the Clipper owns it
+        overClipGizmo: false as boolean,
+      };
+
+      // Section planes are moved with their own TransformControls, which also
+      // want the left button. Without this the camera orbits while the plane
+      // stays put, and a section created flush with a surface can never be
+      // pushed into the model — which is most of what a section is for.
+      const clipGizmoUnderPointer = (): boolean => {
+        const clipper = clipperRef.current as any;
+        if (!clipper) return false;
+        for (const plane of clipper.list.values()) {
+          const gizmo = (plane as any)?._controls;
+          if (gizmo && (gizmo.dragging || gizmo.axis)) return true;
+        }
+        return false;
       };
 
       const onCanvasDown = (e: MouseEvent) => {
@@ -539,6 +555,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         mouseStart.lastX = e.clientX;
         mouseStart.lastY = e.clientY;
         mouseStart.t = Date.now();
+        mouseStart.overClipGizmo = clipGizmoUnderPointer();
+        if (mouseStart.overClipGizmo) {
+          mouseStart.down = false;
+          return;
+        }
         mouseStart.down = true;
         mouseStart.shift = e.shiftKey;
         mouseStart.dragging = false;
@@ -907,6 +928,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
 
       const onCanvasUp = async (e: MouseEvent) => {
         if (e.button !== 0) return;
+        // The Clipper handled this gesture; do not also select on release.
+        if (mouseStart.overClipGizmo) {
+          mouseStart.overClipGizmo = false;
+          return;
+        }
         mouseStart.down = false;
         const dragging = mouseStart.dragging;
         mouseStart.dragging = false;
