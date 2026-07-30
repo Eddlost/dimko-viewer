@@ -49,7 +49,7 @@ Matches what people coming from Dalux expect:
 | Left click | Select (click and drag are told apart by a 5 px threshold) |
 | Shift + left drag | Rectangle select |
 | Middle drag | Pan |
-| Wheel | Zoom toward the pointer, not the screen centre |
+| Wheel | Zooms in on the selected object — the first turn squares the view up on it, then it grows to fill the window. With nothing selected, zooms toward the pointer |
 | Right click | Context menu (isolate, hide, zoom to, section) — no camera movement |
 
 ## Where your files go

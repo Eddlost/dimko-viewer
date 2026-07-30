@@ -213,6 +213,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const meshHighlightsRef = useRef<
     Map<THREE.Mesh, THREE.Material | THREE.Material[]>
   >(new Map());
+  // Bounds of the current selection, cached so the wheel handler can act
+  // without awaiting an async box query mid-gesture. null = nothing selected.
+  const selectionBoxRef = useRef<THREE.Box3 | null>(null);
+  // Whether the view has already been squared up on the current selection.
+  const recentredOnSelectionRef = useRef(false);
   // Camera settings survive a projection swap, which replaces `camera.three`,
   // and a reload (localStorage).
   const initialCameraRef = useRef(loadCameraSettings());
@@ -1147,7 +1152,16 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
             console.warn("[viewer] pivot box failed", modelId, e);
           }
         }
-        if (!hasAny) return;
+        if (!hasAny) {
+          selectionBoxRef.current = null;
+          return;
+        }
+
+        // The wheel handler needs these synchronously.
+        selectionBoxRef.current = merged.clone();
+        recentredOnSelectionRef.current = false;
+        // Zoom should converge on the selection rather than chase the pointer.
+        controls.dollyToCursor = false;
 
         const center = merged.getCenter(new THREE.Vector3());
         try {
@@ -1156,6 +1170,32 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
           console.warn("[viewer] setOrbitPoint failed", e);
         }
       };
+
+      // Zoom behaviour depends on whether anything is selected.
+      //
+      // With a selection, the wheel should home in on that object. Setting the
+      // orbit point alone is not enough: it deliberately leaves the object
+      // wherever it sits on screen (compensating with a focal offset), so
+      // dollying would enlarge it off-centre and never frame it. Squaring the
+      // view up on the selection is what makes repeated scrolling converge on
+      // "the object, centred, filling the window".
+      //
+      // That re-centring is a visible camera move, so it waits for the first
+      // scroll instead of firing on every click — selecting something to read
+      // its properties should not throw the view around.
+      const onWheel = () => {
+        const box = selectionBoxRef.current;
+        if (!box || recentredOnSelectionRef.current) return;
+        recentredOnSelectionRef.current = true;
+        const center = box.getCenter(new THREE.Vector3());
+        try {
+          controls.setFocalOffset(0, 0, 0, true);
+          controls.moveTo(center.x, center.y, center.z, true);
+        } catch (e) {
+          console.warn("[viewer] wheel recentre failed", e);
+        }
+      };
+      canvas.addEventListener("wheel", onWheel, { passive: true });
 
       const onHighlight = (modelIdMap: OBC.ModelIdMap) => {
         const normalized: Record<string, Set<number>> = {};
@@ -1182,6 +1222,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         selectionMapRef.current = {};
         setSelectionMap({});
         setSelection(null);
+        // Nothing to converge on — the wheel goes back to following the
+        // pointer, which is the right default when browsing a whole model.
+        selectionBoxRef.current = null;
+        recentredOnSelectionRef.current = false;
+        controls.dollyToCursor = true;
       };
       highlighter.events.select.onHighlight.add(onHighlight);
       highlighter.events.select.onClear.add(onClear);
@@ -1281,6 +1326,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         canvas.removeEventListener("mousedown", onCanvasDown);
         canvas.removeEventListener("mousemove", onCanvasMove);
         canvas.removeEventListener("mouseup", onCanvasUp);
+        canvas.removeEventListener("wheel", onWheel);
         canvas.removeEventListener("contextmenu", onContextMenu);
         window.removeEventListener("keydown", onKeyDown);
         clipper.onAfterDelete.remove(onAfterDelete);
