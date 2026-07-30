@@ -39,6 +39,19 @@ The result is exact: measure a 2 m box edge and you get `2.000 m`, not
 - Section planes cut from any clicked face
 - Models, measurements and camera settings survive a reload
 
+## Navigation
+
+Matches what people coming from Dalux expect:
+
+| Input | Action |
+|---|---|
+| Left drag | Orbit |
+| Left click | Select (click and drag are told apart by a 5 px threshold) |
+| Shift + left drag | Rectangle select |
+| Middle drag | Pan |
+| Wheel | Zoom toward the pointer, not the screen centre |
+| Right click | Context menu (isolate, hide, zoom to, section) — no camera movement |
+
 ## Where your files go
 
 Nowhere. There is no account, no upload and no server — the model is parsed by

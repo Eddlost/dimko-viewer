@@ -208,6 +208,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const meshModelsRef = useRef<Map<string, MeshModel>>(new Map());
   // Set by the bootstrap effect so loaders outside it can refresh the list.
   const syncModelsRef = useRef<(() => void) | null>(null);
+  // OBJ meshes whose material was swapped for the selection tint, mapped to
+  // the material to put back.
+  const meshHighlightsRef = useRef<
+    Map<THREE.Mesh, THREE.Material | THREE.Material[]>
+  >(new Map());
   // Camera settings survive a projection swap, which replaces `camera.three`,
   // and a reload (localStorage).
   const initialCameraRef = useRef(loadCameraSettings());
@@ -470,11 +475,20 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         (world.camera as any).set?.("Orbit");
       } catch {}
       const controls = world.camera.controls as any;
+      // Dalux-style navigation: left drag orbits, left click selects, middle
+      // drag pans, right does nothing. The left button stays NONE here because
+      // rotation is driven by hand below — camera-controls cannot express
+      // "rotate only once the pointer has moved", which is what lets the same
+      // button also select.
       const applyMouseBindings = () => {
-        controls.mouseButtons.left = 0; // NONE (we drive picking ourselves)
+        controls.mouseButtons.left = 0; // NONE (we drive rotate + picking)
         controls.mouseButtons.middle = 2; // TRUCK (pan)
-        controls.mouseButtons.right = 0; // NONE (reserved)
-        // wheel keeps default DOLLY (zoom)
+        controls.mouseButtons.right = 0; // NONE
+        // Wheel keeps its default action (DOLLY in perspective, ZOOM in
+        // orthographic); dollyToCursor makes both move toward the pointer
+        // rather than the screen centre. Re-asserted here because the
+        // navigation mode resets it when it activates.
+        controls.dollyToCursor = true;
       };
       applyMouseBindings();
       // Re-apply after projection swap (projection.set may reset some control
@@ -491,13 +505,12 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         shift: false,
         lastX: 0,
         lastY: 0,
-        // left button currently held — gates drag-select arming so a plain
-        // move with no button pressed never draws the rectangle.
+        // left button currently held — gates drag arming so a plain move with
+        // no button pressed never rotates or draws the rectangle.
         down: false,
-        // shift+drag = camera rotate
+        // plain left-drag past threshold = orbit
         dragging: false,
-        // plain left-drag past threshold = rectangle select; null mode
-        // becomes "selecting" once the pointer moves enough.
+        // shift+left-drag past threshold = rectangle select
         selecting: false as boolean,
         additive: false as boolean,
       };
@@ -518,14 +531,13 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         mouseStart.t = Date.now();
         mouseStart.down = true;
         mouseStart.shift = e.shiftKey;
-        mouseStart.dragging = e.shiftKey;
+        mouseStart.dragging = false;
         mouseStart.selecting = false;
         mouseStart.additive = e.metaKey || e.ctrlKey;
         if (e.shiftKey) e.preventDefault();
-        // Plain left-drag is ambiguous at mousedown: it could become a
-        // single click or a box-select. We arm the state and only
-        // engage the rect overlay in onMove once the cursor passes
-        // SELECT_DRAG_THRESHOLD. Until then nothing visual changes.
+        // A left press is ambiguous until the pointer moves: click = select,
+        // drag = orbit (or rectangle select with shift). Nothing is decided
+        // here; onCanvasMove commits once past SELECT_DRAG_THRESHOLD.
         void inSpecialMode;
       };
 
@@ -541,6 +553,36 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
             setSelectRect(null);
           }
         }
+        // Commit the drag intent once the pointer has travelled far enough
+        // that this can no longer be a click. Plain drag orbits; shift+drag
+        // draws a selection rectangle. Special modes own the left button
+        // outright, so neither arms while one is active.
+        if (
+          mouseStart.down &&
+          !mouseStart.dragging &&
+          !mouseStart.selecting &&
+          !clipModeRef.current &&
+          !measureModeRef.current &&
+          !volumeModeRef.current &&
+          !polylineModeRef.current
+        ) {
+          const dist = Math.hypot(
+            e.clientX - mouseStart.x,
+            e.clientY - mouseStart.y,
+          );
+          if (dist > SELECT_DRAG_THRESHOLD) {
+            if (mouseStart.shift) {
+              mouseStart.selecting = true;
+            } else {
+              mouseStart.dragging = true;
+              // Anchor the orbit delta at the current position, otherwise the
+              // camera jumps by the whole threshold on the first frame.
+              mouseStart.lastX = e.clientX;
+              mouseStart.lastY = e.clientY;
+            }
+          }
+        }
+
         if (mouseStart.dragging) {
           const dx = e.clientX - mouseStart.lastX;
           const dy = e.clientY - mouseStart.lastY;
@@ -549,29 +591,14 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
           controls.rotate(-dx * ROT_SPEED, -dy * ROT_SPEED, false);
           return;
         }
-        // Detect drag-select arming (left button held without shift).
-        if (
-          mouseStart.down &&
-          !mouseStart.shift &&
-          !clipModeRef.current &&
-          !measureModeRef.current &&
-          !volumeModeRef.current &&
-          !polylineModeRef.current
-        ) {
-          const dx = e.clientX - mouseStart.x;
-          const dy = e.clientY - mouseStart.y;
-          const dist = Math.hypot(dx, dy);
-          if (!mouseStart.selecting && dist > SELECT_DRAG_THRESHOLD) {
-            mouseStart.selecting = true;
-          }
-          if (mouseStart.selecting) {
-            setSelectRect({
-              x1: mouseStart.x,
-              y1: mouseStart.y,
-              x2: e.clientX,
-              y2: e.clientY,
-            });
-          }
+
+        if (mouseStart.selecting) {
+          setSelectRect({
+            x1: mouseStart.x,
+            y1: mouseStart.y,
+            x2: e.clientX,
+            y2: e.clientY,
+          });
         }
         // Snap hover preview while a snap-consuming mode is active and the
         // user is not mid-drag (rotate/select own the cursor then).
@@ -846,7 +873,6 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         const dx = e.clientX - mouseStart.x;
         const dy = e.clientY - mouseStart.y;
         const dist = Math.hypot(dx, dy);
-        const ms = Date.now() - mouseStart.t;
 
         // Drag-select branch: if the cursor moved past threshold without
         // a special mode owning the drag, run a rectangle raycast per
@@ -935,7 +961,9 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
           return;
         }
 
-        if (dist > 5 || ms > 400) return;
+        // Anything that stayed put is a click, however long the button was
+        // held — a slow press must still select.
+        if (dist > SELECT_DRAG_THRESHOLD) return;
         const mouse = new THREE.Vector2(e.clientX, e.clientY);
         try {
           const hit: any = await pickFirstVisible(mouse);
@@ -1427,7 +1455,54 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     [loadIfcBytes],
   );
 
+  /**
+   * Put every swapped material back. Must run before any OBJ model is
+   * disposed: disposeMeshModel frees whatever material a mesh is holding, and
+   * a highlighted mesh is holding the shared tint, which every later
+   * selection would then be missing.
+   */
+  const restoreMeshHighlights = useCallback(() => {
+    for (const [mesh, material] of meshHighlightsRef.current) {
+      mesh.material = material;
+    }
+    meshHighlightsRef.current.clear();
+  }, []);
+
+  // Mirror the selection onto OBJ geometry. Fragments models are handled by
+  // the Highlighter; this covers the meshes it cannot see.
+  useEffect(() => {
+    const models = meshModelsRef.current;
+    const highlighted = meshHighlightsRef.current;
+    if (!models.size && !highlighted.size) return;
+
+    const wanted = new Set<THREE.Mesh>();
+    for (const [modelId, ids] of Object.entries(selectionMap)) {
+      const model = models.get(modelId);
+      if (!model) continue;
+      for (const localId of ids) {
+        const part = model.parts.get(localId);
+        if (part) wanted.add(part.mesh);
+      }
+    }
+
+    for (const [mesh, material] of highlighted) {
+      if (!wanted.has(mesh)) {
+        mesh.material = material;
+        highlighted.delete(mesh);
+      }
+    }
+    for (const mesh of wanted) {
+      if (highlighted.has(mesh)) continue;
+      highlighted.set(mesh, mesh.material);
+      mesh.material = meshHighlightMaterial;
+    }
+
+    const fragments = fragmentsRef.current;
+    if (fragments?.initialized) fragments.core.update(true);
+  }, [selectionMap]);
+
   const clear = useCallback(() => {
+    restoreMeshHighlights();
     for (const model of meshModelsRef.current.values()) disposeMeshModel(model);
     meshModelsRef.current.clear();
 
@@ -1446,11 +1521,12 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     setSelectionMap({});
     syncModelsRef.current?.();
     if (fragments.initialized) fragments.core.update(true);
-  }, []);
+  }, [restoreMeshHighlights]);
 
   const removeModel = useCallback(async (modelId: string) => {
     const meshModel = meshModelsRef.current.get(modelId);
     if (meshModel) {
+      restoreMeshHighlights();
       disposeMeshModel(meshModel);
       meshModelsRef.current.delete(modelId);
       displayNamesRef.current.delete(modelId);
@@ -1475,7 +1551,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       setSelectionMap(next);
     }
     if (fragments.initialized) fragments.core.update(true);
-  }, []);
+  }, [restoreMeshHighlights]);
 
   const setVisibility = useCallback(async (visible: boolean, items?: OBC.ModelIdMap) => {
     const hider = hiderRef.current;
@@ -2875,6 +2951,17 @@ function keepScreenSize(mesh: THREE.Mesh, pixelRadius: number) {
     mesh.updateMatrixWorld(true);
   };
 }
+
+/**
+ * Selection tint for OBJ parts. The fragments Highlighter only reaches
+ * worker-side geometry, so plain three.js meshes would otherwise select with
+ * no visible feedback at all.
+ */
+const meshHighlightMaterial = new THREE.MeshLambertMaterial({
+  color: 0x38bdf8,
+  emissive: 0x0c4a6e,
+  side: THREE.DoubleSide,
+});
 
 /**
  * Push field of view and clipping planes onto whichever THREE camera the
