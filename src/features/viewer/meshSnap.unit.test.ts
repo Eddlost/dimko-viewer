@@ -4,6 +4,7 @@ import {
   chooseSnapCandidate,
   faceSnapCandidates,
   projectToScreen,
+  sectionSnapCandidates,
   type SnapCandidate,
 } from "./meshSnap";
 
@@ -80,6 +81,56 @@ describe("faceSnapCandidates", () => {
     const hit = triangleHit();
     (hit as any).face = null;
     expect(faceSnapCandidates(hit)).toEqual([]);
+  });
+});
+
+describe("sectionSnapCandidates", () => {
+  // The test triangle spans (0,0)-(2,0)-(0,2) in the XY plane.
+  const cutAtX = (x: number) =>
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), -x);
+
+  it("returns the two crossings plus their midpoint", () => {
+    const found = sectionSnapCandidates(triangleHit(), [cutAtX(1)]);
+    expect(found).toHaveLength(3);
+    expect(found.every((c) => c.kind === "section")).toBe(true);
+    const xs = found.map((c) => +c.point.x.toFixed(6));
+    expect(xs).toEqual([1, 1, 1]);
+    // Crossings on the two edges that straddle x = 1, then the midpoint.
+    const ys = found.map((c) => +c.point.y.toFixed(6)).sort((a, b) => a - b);
+    expect(ys).toEqual([0, 0.5, 1]);
+  });
+
+  it("returns nothing when the plane misses the triangle", () => {
+    expect(sectionSnapCandidates(triangleHit(), [cutAtX(5)])).toEqual([]);
+    expect(sectionSnapCandidates(triangleHit(), [cutAtX(-5)])).toEqual([]);
+  });
+
+  it("ignores an edge lying exactly in the plane", () => {
+    // x = 0 contains the edge from (0,0) to (0,2); a coincident edge has no
+    // single crossing point to snap to.
+    const found = sectionSnapCandidates(triangleHit(), [cutAtX(0)]);
+    expect(found.every((c) => Number.isFinite(c.point.x))).toBe(true);
+  });
+
+  it("handles several planes at once", () => {
+    const found = sectionSnapCandidates(triangleHit(), [cutAtX(0.5), cutAtX(1.5)]);
+    expect(found).toHaveLength(6);
+  });
+
+  it("returns nothing without planes or without a face", () => {
+    expect(sectionSnapCandidates(triangleHit(), [])).toEqual([]);
+    const hit = triangleHit();
+    (hit as any).face = null;
+    expect(sectionSnapCandidates(hit, [cutAtX(1)])).toEqual([]);
+  });
+
+  it("applies the mesh world transform", () => {
+    const found = sectionSnapCandidates(
+      triangleHit(new THREE.Vector3(10, 0, 0)),
+      [cutAtX(11)],
+    );
+    expect(found).toHaveLength(3);
+    expect(found.every((c) => Math.abs(c.point.x - 11) < 1e-6)).toBe(true);
   });
 });
 

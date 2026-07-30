@@ -36,7 +36,9 @@ The result is exact: measure a 2 m box edge and you get `2.000 m`, not
 - Per-model and per-group visibility, isolate, hide, zoom-to
 - Element properties including IFC property sets
 - **Distance** and **polyline** measurement with vertex/edge snapping
-- Section planes cut from any clicked face
+- Section planes cut from any clicked face, flippable, with snapping to the
+  cut itself — the exposed edge exists only on screen, so measuring along a
+  section is impossible without it
 - Models, measurements and camera settings survive a reload
 
 ## Navigation
@@ -89,7 +91,7 @@ subpath deployment works without extra configuration.
 ```
 src/features/viewer/
   useViewer.ts     scene, picking, snapping, measurement, clipping, visibility
-  meshSnap.ts      screen-space snap maths for OBJ geometry (unit-tested)
+  meshSnap.ts      snap maths for OBJ: vertices, edges, section cuts (tested)
   screenScale.ts   constant-size markers + clipping planes (unit-tested)
   objModel.ts      OBJ parsing into three.js meshes with stable part ids
   visibility.ts    visibility snapshot logic (unit-tested)

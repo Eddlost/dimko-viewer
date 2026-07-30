@@ -46,6 +46,7 @@ export function Toolbar() {
     setClipMode,
     clipCount,
     deleteAllClips,
+    flipClips,
     snapEnabled,
     setSnapEnabled,
     showAll,
@@ -119,6 +120,14 @@ export function Toolbar() {
         title="Cut a section plane through a clicked face"
         onClick={() => setClipMode(!clipMode)}
       />
+      {clipCount > 0 && (
+        <ToolButton
+          label="Flip"
+          icon="⇄"
+          title="Swap which side of the section is kept"
+          onClick={() => flipClips()}
+        />
+      )}
       {clipCount > 0 && (
         <ToolButton
           label={`Clear cuts (${clipCount})`}

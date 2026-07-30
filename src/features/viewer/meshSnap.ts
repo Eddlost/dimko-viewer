@@ -10,7 +10,7 @@
 
 import * as THREE from "three";
 
-export type SnapKind = "vertex" | "edge" | "surface";
+export type SnapKind = "vertex" | "edge" | "section" | "surface";
 
 export type SnapCandidate = {
   point: THREE.Vector3;
@@ -43,24 +43,69 @@ export function projectToScreen(
   };
 }
 
-/**
- * Corner and edge-midpoint candidates of the hit triangle, in world space.
- * Corners come first so that a tie in screen distance resolves to the corner —
- * that is what a user aiming at a box edge expects.
- */
-export function faceSnapCandidates(hit: THREE.Intersection): SnapCandidate[] {
+/** World-space corners of the triangle that was hit, or null if unavailable. */
+function triangleCorners(hit: THREE.Intersection): THREE.Vector3[] | null {
   const face = hit.face;
   const object = hit.object as THREE.Mesh;
   const geometry = object?.geometry as THREE.BufferGeometry | undefined;
   const position = geometry?.attributes?.position as
     | THREE.BufferAttribute
     | undefined;
-  if (!face || !position) return [];
+  if (!face || !position) return null;
 
-  const corners = [face.a, face.b, face.c].map((index) => {
+  return [face.a, face.b, face.c].map((index) => {
     const v = new THREE.Vector3().fromBufferAttribute(position, index);
     return object.localToWorld(v);
   });
+}
+
+/**
+ * Where a section plane cuts the hit triangle.
+ *
+ * A section exposes an edge that exists only on screen — no vertex of the
+ * model sits on it — so measuring along a cut is impossible without snapping
+ * to it. Each plane crosses the triangle in at most one segment; both its ends
+ * and its midpoint are offered.
+ */
+export function sectionSnapCandidates(
+  hit: THREE.Intersection,
+  planes: THREE.Plane[],
+): SnapCandidate[] {
+  if (!planes.length) return [];
+  const corners = triangleCorners(hit);
+  if (!corners) return [];
+
+  const out: SnapCandidate[] = [];
+  for (const plane of planes) {
+    const crossings: THREE.Vector3[] = [];
+    for (let i = 0; i < 3; i++) {
+      const a = corners[i];
+      const b = corners[(i + 1) % 3];
+      const da = plane.distanceToPoint(a);
+      const db = plane.distanceToPoint(b);
+      // Same side, or an edge lying in the plane (no single crossing point).
+      if (da === db || (da > 0 && db > 0) || (da < 0 && db < 0)) continue;
+      crossings.push(a.clone().lerp(b, da / (da - db)));
+    }
+    for (const point of crossings) out.push({ point, kind: "section" });
+    if (crossings.length === 2) {
+      out.push({
+        point: crossings[0].clone().lerp(crossings[1], 0.5),
+        kind: "section",
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Corner and edge-midpoint candidates of the hit triangle, in world space.
+ * Corners come first so that a tie in screen distance resolves to the corner —
+ * that is what a user aiming at a box edge expects.
+ */
+export function faceSnapCandidates(hit: THREE.Intersection): SnapCandidate[] {
+  const corners = triangleCorners(hit);
+  if (!corners) return [];
 
   const out: SnapCandidate[] = corners.map((point) => ({
     point,

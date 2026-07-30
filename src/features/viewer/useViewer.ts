@@ -17,6 +17,7 @@ import {
 import {
   chooseSnapCandidate,
   faceSnapCandidates,
+  sectionSnapCandidates,
 } from "./meshSnap";
 import {
   clipPlanesForDiagonal,
@@ -33,8 +34,12 @@ import {
 } from "../../lib/cameraSettings";
 import {
   disposeMeshModel,
+  idsForModel,
+  isObjectVisible,
+  isolateMeshParts,
   meshModelsBounds,
   parseObj,
+  setMeshPartsVisible,
   type MeshModel,
 } from "./objModel";
 
@@ -633,6 +638,17 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       // Hits are normalised to the shape the fragments worker returns so both
       // sources can be merged and sorted by distance in one list.
       const meshRaycaster = new THREE.Raycaster();
+      // Active section planes as THREE.Plane. The Clipper keeps these updated
+      // as the user drags a plane, so holding the references is enough.
+      const activeClipPlanes = (): THREE.Plane[] => {
+        const clipper = clipperRef.current as any;
+        if (!clipper) return [];
+        const out: THREE.Plane[] = [];
+        for (const plane of clipper.list.values()) {
+          if (plane?.three?.isPlane) out.push(plane.three);
+        }
+        return out;
+      };
       const cursorFrame = (mouse: THREE.Vector2) => {
         const rect = canvas.getBoundingClientRect();
         return {
@@ -659,7 +675,18 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
           if (model.object.visible) targets.push(model.object);
         }
         if (!targets.length) return [];
-        return meshRaycaster.intersectObjects(targets, true).map((hit) => ({
+        const planes = activeClipPlanes();
+        return meshRaycaster
+          .intersectObjects(targets, true)
+          // The raycaster does not consult `visible`, so hidden parts would
+          // still be pickable after an isolate or hide.
+          .filter((hit) => isObjectVisible(hit.object))
+          // Nor does it know about clipping: without this, clicking a section
+          // picks the geometry the cut removed, which is not on screen.
+          .filter((hit) =>
+            planes.every((plane) => plane.distanceToPoint(hit.point) >= 0),
+          )
+          .map((hit) => ({
           point: hit.point,
           distance: hit.distance,
           localId: (hit.object.userData?.localId as number) ?? -1,
@@ -736,9 +763,18 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         if (!snapEnabledRef.current) return surfaceResult(mouse);
         // OBJ has no worker-side snapping pipeline — derive candidates from the
         // hit triangle and pick the one nearest the cursor on screen.
+        const planes = activeClipPlanes();
         const all: any[] = raycastMeshes(mouse).map((hit) => {
+          const face = faceSnapCandidates(hit.meshIntersection);
+          // Vertices win ties, then the section cut, then plain edge midpoints:
+          // a real corner is the most trustworthy thing to measure from, but a
+          // cut edge beats the middle of an uncut edge.
           const candidate = chooseSnapCandidate(
-            faceSnapCandidates(hit.meshIntersection),
+            [
+              ...face.filter((c) => c.kind === "vertex"),
+              ...sectionSnapCandidates(hit.meshIntersection, planes),
+              ...face.filter((c) => c.kind === "edge"),
+            ],
             world.camera.three,
             cursorFrame(mouse),
             MESH_SNAP_RADIUS_PX,
@@ -1252,7 +1288,13 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       // harness (camera state and scene contents are otherwise unreachable
       // from page scripts). Never present in a production build.
       if (import.meta.env.DEV) {
-        (window as any).__dimkoViewer = { world, fragments, measureGroup };
+        (window as any).__dimkoViewer = {
+          world,
+          fragments,
+          measureGroup,
+          components,
+          clipper,
+        };
       }
 
       const onKeyDown = (e: KeyboardEvent) => {
@@ -1600,8 +1642,12 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   }, [restoreMeshHighlights]);
 
   const setVisibility = useCallback(async (visible: boolean, items?: OBC.ModelIdMap) => {
+    setMeshPartsVisible(meshModelsRef.current, visible, items as any);
     const hider = hiderRef.current;
-    if (!hider) return;
+    if (!hider) {
+      bumpRuntimeVisibility();
+      return;
+    }
     await hider.set(visible, items);
     bumpRuntimeVisibility();
   }, [bumpRuntimeVisibility]);
@@ -1650,6 +1696,10 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const isolate = useCallback(async (items: OBC.ModelIdMap) => {
     const hider = hiderRef.current;
     const fragments = fragmentsRef.current;
+    // OBJ parts are plain meshes the Hider cannot see, so their visibility is
+    // driven directly. Done before the early return: a scene of only OBJ
+    // models has no Hider to speak of.
+    isolateMeshParts(meshModelsRef.current, items as any);
     if (!hider) return;
     // hider.isolate(items) only affects models present in items. In multi-model
     // scenes "isolate" must hide everything else, including geometry of models
@@ -1710,9 +1760,9 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   );
 
   const hide = useCallback(async (items: OBC.ModelIdMap) => {
+    setMeshPartsVisible(meshModelsRef.current, false, items as any);
     const hider = hiderRef.current;
-    if (!hider) return;
-    await hider.set(false, items);
+    if (hider) await hider.set(false, items);
     const pruneMap: Record<string, Set<number> | null> = {};
     for (const [mid, ids] of Object.entries(items)) {
       if (!ids) continue;
@@ -1799,9 +1849,16 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   }, [bumpRuntimeVisibility, restoreModelElements]);
 
   const showAll = useCallback(async () => {
+    setMeshPartsVisible(meshModelsRef.current, true);
     const hider = hiderRef.current;
     const fragments = fragmentsRef.current;
-    if (!hider) return;
+    if (!hider) {
+      isolationRootRef.current = null;
+      setIsolationRootVersion((v) => v + 1);
+      setShowAllVersion((v) => v + 1);
+      bumpRuntimeVisibility();
+      return;
+    }
     await hider.set(true);
     if (fragments) {
       for (const [, model] of fragments.list as any) {
@@ -2497,10 +2554,30 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const zoomToSelection = useCallback(async (map: OBC.ModelIdMap) => {
     const world = worldRef.current;
     const fragments = fragmentsRef.current;
-    if (!world || !fragments) return;
+    if (!world) return;
     const merged = new THREE.Box3();
     let hasAny = false;
+
+    // OBJ parts: bounds straight off the scene graph.
+    for (const [modelId, model] of meshModelsRef.current) {
+      const ids = idsForModel(map as any, modelId);
+      if (!ids) continue;
+      for (const id of ids) {
+        const part = model.parts.get(id);
+        if (!part) continue;
+        const box = new THREE.Box3().setFromObject(part.mesh);
+        if (box.isEmpty()) continue;
+        if (hasAny) {
+          merged.union(box);
+        } else {
+          merged.copy(box);
+          hasAny = true;
+        }
+      }
+    }
+
     for (const [modelId, ids] of Object.entries(map)) {
+      if (!fragments) break;
       const model: any = fragments.list.get(modelId);
       if (!model) continue;
       const idArr = ids instanceof Set ? Array.from(ids) : (ids as any[]);

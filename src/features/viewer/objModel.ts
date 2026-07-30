@@ -89,6 +89,70 @@ export function parseObj(
   return { id: modelId, name: displayName, object: group, parts };
 }
 
+/** Ids of `map` belonging to `modelId`, normalised to a Set. */
+export function idsForModel(
+  map: Record<string, unknown>,
+  modelId: string,
+): Set<number> | null {
+  const ids = map[modelId];
+  if (!ids) return null;
+  if (ids instanceof Set) return ids as Set<number>;
+  if (Array.isArray(ids)) return new Set(ids as number[]);
+  return null;
+}
+
+/**
+ * Show only the listed parts, hiding every other OBJ part in the scene.
+ * The Hider handles this for fragments; OBJ needs it done by hand.
+ */
+export function isolateMeshParts(
+  models: Iterable<[string, MeshModel]>,
+  map: Record<string, unknown>,
+) {
+  for (const [modelId, model] of models) {
+    const wanted = idsForModel(map, modelId);
+    model.object.visible = wanted !== null;
+    for (const part of model.parts.values()) {
+      part.mesh.visible = wanted ? wanted.has(part.localId) : false;
+    }
+  }
+}
+
+/** Set visibility of the listed parts; `map` undefined means every part. */
+export function setMeshPartsVisible(
+  models: Iterable<[string, MeshModel]>,
+  visible: boolean,
+  map?: Record<string, unknown>,
+) {
+  for (const [modelId, model] of models) {
+    if (!map) {
+      model.object.visible = visible;
+      for (const part of model.parts.values()) part.mesh.visible = visible;
+      continue;
+    }
+    const ids = idsForModel(map, modelId);
+    if (!ids) continue;
+    if (visible) model.object.visible = true;
+    for (const id of ids) {
+      const part = model.parts.get(id);
+      if (part) part.mesh.visible = visible;
+    }
+  }
+}
+
+/**
+ * Raycasting ignores `visible`, so hidden parts stay pickable unless they are
+ * filtered out — which would let a click select something nobody can see.
+ */
+export function isObjectVisible(object: THREE.Object3D | null): boolean {
+  let node: THREE.Object3D | null = object;
+  while (node) {
+    if (node.visible === false) return false;
+    node = node.parent;
+  }
+  return true;
+}
+
 /** Free GPU memory for a model that is being removed from the scene. */
 export function disposeMeshModel(model: MeshModel) {
   model.object.traverse((child) => {
