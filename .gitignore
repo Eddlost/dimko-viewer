@@ -3,6 +3,10 @@ dist
 dist-ssr
 *.local
 
+# Internal working notes (deploy runbook, planning) — this is a public repo,
+# these stay local.
+/ai
+
 # Logs
 logs
 *.log

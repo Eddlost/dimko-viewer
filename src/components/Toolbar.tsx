@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import { useViewerContext } from "../features/viewer/ViewerContext";
 import { useModelImport } from "../features/viewer/useModelImport";
+import { useMeasurements } from "../features/measurements/MeasurementsContext";
 import { ACCEPTED_EXTENSIONS } from "../lib/fileImport";
 
 type ButtonProps = {
@@ -48,9 +49,11 @@ export function Toolbar() {
     setSnapEnabled,
     showAll,
     clear,
-    deleteAllMeasurements,
   } = useViewerContext();
   const { importFiles } = useModelImport();
+  // Goes through the store, not the viewer, so the list and the scene stay in
+  // step — clearing one without the other is what left orphaned dimensions.
+  const { clear: clearMeasurements } = useMeasurements();
   const fileInput = useRef<HTMLInputElement>(null);
 
   const hasModels = models.length > 0;
@@ -138,7 +141,7 @@ export function Toolbar() {
         title="Remove all models and measurements from the scene"
         onClick={() => {
           clear();
-          deleteAllMeasurements();
+          clearMeasurements();
           deleteAllClips();
         }}
       />

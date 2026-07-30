@@ -18,6 +18,7 @@ import {
   chooseSnapCandidate,
   faceSnapCandidates,
 } from "./meshSnap";
+import { markerScale } from "./screenScale";
 import {
   disposeMeshModel,
   meshModelsBounds,
@@ -214,6 +215,8 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   // panel watches this and prompts inline. null = nothing pending.
   const [pendingMeasurement, setPendingMeasurement] = useState<{
     kind: "distance" | "polyline" | "volume-hull" | "volume-pair" | "volume-mesh" | "volume-approx";
+    /** Ties the stored row to its scene objects; see removeMeasurementVisual. */
+    visualId?: string;
     value: number;
     unit: string;
     points: Array<[number, number, number]>;
@@ -969,12 +972,13 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
                 disposeObject(measureAnchorVisualRef.current);
                 measureAnchorVisualRef.current = null;
               }
-              const measurement = makeMeasurement(a, b);
-              group.add(measurement);
+              const visualId = nextMeasurementId();
+              group.add(makeMeasurement(a, b, visualId));
               setMeasureCount(countMeasurements(group));
               const distance = a.distanceTo(b);
               setPendingMeasurement({
                 kind: "distance",
+                visualId,
                 value: distance,
                 unit: "m",
                 points: [
@@ -1025,6 +1029,55 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       canvas.addEventListener("mouseup", onCanvasUp);
       canvas.addEventListener("contextmenu", onContextMenu);
 
+      // Orbit and dolly around whatever was just selected. In a scene holding
+      // several objects the controls otherwise pivot about the scene centre,
+      // so zooming into one object swings it straight out of frame.
+      // `setOrbitPoint` moves the pivot without moving the camera, which keeps
+      // the view stable at the moment of selection.
+      const focusPivot = async (map: Record<string, Set<number>>) => {
+        const controls: any = world.camera.controls;
+        if (typeof controls?.setOrbitPoint !== "function") return;
+
+        const merged = new THREE.Box3();
+        let hasAny = false;
+        const absorb = (box: THREE.Box3) => {
+          if (box.isEmpty()) return;
+          if (hasAny) {
+            merged.union(box);
+          } else {
+            merged.copy(box);
+            hasAny = true;
+          }
+        };
+
+        for (const [modelId, ids] of Object.entries(map)) {
+          if (!ids?.size) continue;
+          const meshModel = meshModelsRef.current.get(modelId);
+          if (meshModel) {
+            for (const localId of ids) {
+              const part = meshModel.parts.get(localId);
+              if (part) absorb(new THREE.Box3().setFromObject(part.mesh));
+            }
+            continue;
+          }
+          const model: any = fragments.list.get(modelId);
+          if (!model) continue;
+          try {
+            absorb(await model.getMergedBox(Array.from(ids)));
+          } catch (e) {
+            console.warn("[viewer] pivot box failed", modelId, e);
+          }
+        }
+        if (!hasAny) return;
+
+        const center = merged.getCenter(new THREE.Vector3());
+        try {
+          controls.setOrbitPoint(center.x, center.y, center.z);
+        } catch (e) {
+          console.warn("[viewer] setOrbitPoint failed", e);
+        }
+      };
+
       const onHighlight = (modelIdMap: OBC.ModelIdMap) => {
         const normalized: Record<string, Set<number>> = {};
         let primary: SelectionTarget = null;
@@ -1044,6 +1097,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         selectionMapRef.current = normalized;
         setSelectionMap(normalized);
         setSelection(primary);
+        void focusPivot(normalized);
       };
       const onClear = () => {
         selectionMapRef.current = {};
@@ -1069,6 +1123,13 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       measureGroup.name = "DIMKO_measurements";
       world.scene.three.add(measureGroup);
       measureGroupRef.current = measureGroup;
+
+      // Dev-only handle so the viewer can be driven from a browser test
+      // harness (camera state and scene contents are otherwise unreachable
+      // from page scripts). Never present in a production build.
+      if (import.meta.env.DEV) {
+        (window as any).__dimkoViewer = { world, fragments, measureGroup };
+      }
 
       const onKeyDown = (e: KeyboardEvent) => {
         const target = e.target as HTMLElement | null;
@@ -1214,7 +1275,10 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
         const ifcLoader = components.get(OBC.IfcLoader);
         await ifcLoader.setup({
           autoSetWasm: false,
-          wasm: { path: "/wasm/", absolute: false },
+          // Must follow Vite's base: a root-absolute "/wasm/" 404s as soon as
+          // the app is served from a subpath, which is exactly what a GitHub
+          // Pages project site does.
+          wasm: { path: `${import.meta.env.BASE_URL}wasm/`, absolute: false },
         });
         const model = await ifcLoader.load(bytes, true, modelId, {
           // IFCGROUP není v defaultním class setu importeru a členská relace
@@ -1849,10 +1913,12 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     polylineObjectsRef.current = [];
     let total = 0;
     for (let i = 1; i < points.length; i++) total += points[i].distanceTo(points[i - 1]);
-    group.add(makePolyline(points, total));
+    const visualId = nextMeasurementId();
+    group.add(makePolyline(points, total, visualId));
     setMeasureCount(countMeasurements(group));
     setPendingMeasurement({
       kind: "polyline",
+      visualId,
       value: total,
       unit: "m",
       points: points.map((p): [number, number, number] => [p.x, p.y, p.z]),
@@ -1875,6 +1941,25 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     snapEnabledRef.current = enabled;
     setSnapEnabledState(enabled);
     if (!enabled) clearSnapHoverRef.current?.();
+  }, []);
+
+  /**
+   * Drop the objects drawn for one measurement. The panel owns the list, the
+   * viewer owns the scene, and `visualId` is the only thing joining them —
+   * without this a deleted row leaves its line and label floating in the model.
+   */
+  const removeMeasurementVisual = useCallback((visualId: string) => {
+    const group = measureGroupRef.current;
+    if (!group) return;
+    const target = group.children.find(
+      (child) => (child as any).userData?.measurementId === visualId,
+    );
+    if (!target) return;
+    group.remove(target);
+    disposeObject(target);
+    setMeasureCount(countMeasurements(group));
+    const fragments = fragmentsRef.current;
+    if (fragments?.initialized) fragments.core.update(true);
   }, []);
 
   const deleteAllMeasurements = useCallback(() => {
@@ -2594,6 +2679,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     measureCount,
     setMeasureMode,
     deleteAllMeasurements,
+    removeMeasurementVisual,
     volumeMode,
     volumePointCount,
     setVolumeMode,
@@ -2655,28 +2741,82 @@ const LINE_COLOR = 0xff6b3d;
 const SNAP_VERTEX_COLOR = 0x22d3ee;
 const SNAP_SURFACE_COLOR = 0x94a3b8;
 
+// On-screen radii, in CSS pixels, of the measurement markers. They are held
+// constant by keepScreenSize below.
+const RETICLE_PX = 5;
+const ANCHOR_PX = 4.5;
+const ENDPOINT_PX = 4;
+
+// The radius the sphere geometry is authored with. Scale = wanted world size
+// divided by this.
+const MARKER_GEOMETRY_RADIUS = 1;
+
+const tmpMarkerPosition = new THREE.Vector3();
+
+/**
+ * Hold a marker at a fixed pixel size no matter the zoom.
+ *
+ * A marker authored in world units is invisible when zoomed out and swallows
+ * the model when zoomed in — the exact thing you cannot afford when the marker
+ * shows *where a measurement will land*. `onBeforeRender` runs before the
+ * renderer derives `modelViewMatrix` from `matrixWorld`, so refreshing the
+ * matrix here lands in the same frame rather than one frame late.
+ */
+function keepScreenSize(mesh: THREE.Mesh, pixelRadius: number) {
+  mesh.onBeforeRender = (renderer, _scene, camera) => {
+    const distance = camera.position.distanceTo(
+      mesh.getWorldPosition(tmpMarkerPosition),
+    );
+    const scale = markerScale(
+      camera,
+      renderer.domElement.clientHeight,
+      distance,
+      pixelRadius,
+      MARKER_GEOMETRY_RADIUS,
+    );
+    if (scale === null) return;
+    mesh.scale.setScalar(scale);
+    mesh.updateMatrixWorld(true);
+  };
+}
+
+/**
+ * Handle tying a stored measurement to the objects drawn for it, so deleting
+ * a row in the panel can clear the scene too.
+ */
+let measurementSeq = 0;
+function nextMeasurementId(): string {
+  measurementSeq += 1;
+  return `mv-${measurementSeq}`;
+}
+
+/** Unit-radius sphere; every marker is scaled to its pixel size at render. */
+function markerGeometry(segments = 12): THREE.SphereGeometry {
+  return new THREE.SphereGeometry(MARKER_GEOMETRY_RADIUS, segments, segments);
+}
+
 function makeAnchorSphere(point: THREE.Vector3): THREE.Object3D {
-  const geo = new THREE.SphereGeometry(0.06, 12, 12);
   const mat = new THREE.MeshBasicMaterial({ color: ANCHOR_COLOR });
-  const mesh = new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(markerGeometry(), mat);
   mesh.position.copy(point);
   (mesh as any).userData.dimkoMeasure = "anchor";
+  keepScreenSize(mesh, ANCHOR_PX);
   return mesh;
 }
 
 // Small always-on-top reticle previewing where the next click lands.
 function makeSnapReticle(point: THREE.Vector3, snapped: boolean): THREE.Object3D {
-  const geo = new THREE.SphereGeometry(0.07, 14, 14);
   const mat = new THREE.MeshBasicMaterial({
     color: snapped ? SNAP_VERTEX_COLOR : SNAP_SURFACE_COLOR,
     depthTest: false,
     transparent: true,
     opacity: 0.95,
   });
-  const mesh = new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(markerGeometry(14), mat);
   mesh.position.copy(point);
   mesh.renderOrder = 1000;
   (mesh as any).userData.dimkoMeasure = "snap-hover";
+  keepScreenSize(mesh, RETICLE_PX);
   return mesh;
 }
 
@@ -2726,14 +2866,20 @@ function makeSegmentLine(a: THREE.Vector3, b: THREE.Vector3): THREE.Object3D {
 
 // Finalized polyline measurement: vertex dots + connecting segments + one
 // label at the chain's midpoint carrying the total length.
-function makePolyline(points: THREE.Vector3[], total: number): THREE.Object3D {
+function makePolyline(
+  points: THREE.Vector3[],
+  total: number,
+  measurementId: string,
+): THREE.Object3D {
   const group = new THREE.Group();
   (group as any).userData.dimkoMeasure = "measurement";
-  const dotGeo = new THREE.SphereGeometry(0.05, 12, 12);
+  (group as any).userData.measurementId = measurementId;
+  const dotGeo = markerGeometry();
   const dotMat = new THREE.MeshBasicMaterial({ color: ANCHOR_COLOR });
   for (const p of points) {
     const dot = new THREE.Mesh(dotGeo, dotMat);
     dot.position.copy(p);
+    keepScreenSize(dot, ENDPOINT_PX);
     group.add(dot);
   }
   const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
@@ -2769,17 +2915,24 @@ function makePolyline(points: THREE.Vector3[], total: number): THREE.Object3D {
   return group;
 }
 
-function makeMeasurement(a: THREE.Vector3, b: THREE.Vector3): THREE.Object3D {
+function makeMeasurement(
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  measurementId: string,
+): THREE.Object3D {
   const group = new THREE.Group();
   (group as any).userData.dimkoMeasure = "measurement";
+  (group as any).userData.measurementId = measurementId;
 
   // Endpoint markers
   const matEnd = new THREE.MeshBasicMaterial({ color: ANCHOR_COLOR });
-  const sphereGeo = new THREE.SphereGeometry(0.05, 12, 12);
+  const sphereGeo = markerGeometry();
   const sA = new THREE.Mesh(sphereGeo, matEnd);
   sA.position.copy(a);
+  keepScreenSize(sA, ENDPOINT_PX);
   const sB = new THREE.Mesh(sphereGeo, matEnd);
   sB.position.copy(b);
+  keepScreenSize(sB, ENDPOINT_PX);
   group.add(sA);
   group.add(sB);
 

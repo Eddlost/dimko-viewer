@@ -1,12 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { useViewerContext } from "../viewer/ViewerContext";
+import { useState } from "react";
 import { useMeasurements } from "./MeasurementsContext";
-
-const KIND_LABEL: Record<string, string> = {
-  distance: "Distance",
-  polyline: "Polyline",
-  "volume-mesh": "Volume",
-};
 
 function format(value: number, unit: string): string {
   const decimals = Math.abs(value) < 10 ? 3 : 2;
@@ -14,32 +7,9 @@ function format(value: number, unit: string): string {
 }
 
 export function MeasurementsPanel() {
-  const { pendingMeasurement, clearPendingMeasurement } = useViewerContext();
-  const { measurements, add, rename, remove, clear, totals } = useMeasurements();
+  const { measurements, rename, remove, clear, totals } = useMeasurements();
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-
-  // Each finished measurement must be stored exactly once. `clearPending-
-  // Measurement` is a fresh closure on every render, so this effect re-runs
-  // constantly, and StrictMode invokes it twice per mount — keying on the
-  // pending object's identity is what makes consumption idempotent.
-  const consumed = useRef<typeof pendingMeasurement>(null);
-  const count = useRef(0);
-  count.current = measurements.length;
-
-  useEffect(() => {
-    if (!pendingMeasurement || consumed.current === pendingMeasurement) return;
-    consumed.current = pendingMeasurement;
-    const label = KIND_LABEL[pendingMeasurement.kind] ?? pendingMeasurement.kind;
-    add({
-      name: `${label} ${count.current + 1}`,
-      kind: pendingMeasurement.kind,
-      value: pendingMeasurement.value,
-      unit: pendingMeasurement.unit,
-      points: pendingMeasurement.points,
-    });
-    clearPendingMeasurement();
-  }, [add, clearPendingMeasurement, pendingMeasurement]);
 
   return (
     <div className="flex flex-col h-full">
