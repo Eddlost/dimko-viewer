@@ -30,6 +30,8 @@ The result is exact: measure a 2 m box edge and you get `2.000 m`, not
 
 - Load `.ifc`, `.obj` and `.frag` by drag-and-drop or file picker
 - Orbit / pan / zoom, orientation gizmo, fit-to-model
+- Perspective or orthographic camera, with an adjustable field of view
+- Orbits around whatever you selected, not the scene centre
 - Structure tree — storeys and categories for IFC, parts for OBJ
 - Per-model and per-group visibility, isolate, hide, zoom-to
 - Element properties including IFC property sets
@@ -64,8 +66,10 @@ subpath deployment works without extra configuration.
 src/features/viewer/
   useViewer.ts     scene, picking, snapping, measurement, clipping, visibility
   meshSnap.ts      screen-space snap maths for OBJ geometry (unit-tested)
+  screenScale.ts   constant-size markers + clipping planes (unit-tested)
   objModel.ts      OBJ parsing into three.js meshes with stable part ids
   visibility.ts    visibility snapshot logic (unit-tested)
+  CameraPanel.tsx  projection + field-of-view controls
 src/features/models/        structure tree
 src/features/properties/    property panel + property index
 src/features/measurements/  measurement list, localStorage persistence

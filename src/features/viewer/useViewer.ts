@@ -18,7 +18,12 @@ import {
   chooseSnapCandidate,
   faceSnapCandidates,
 } from "./meshSnap";
-import { markerScale } from "./screenScale";
+import {
+  clipPlanesForDiagonal,
+  markerScale,
+  DEFAULT_SCENE_DIAGONAL,
+  type ClipPlanes,
+} from "./screenScale";
 import {
   disposeMeshModel,
   meshModelsBounds,
@@ -47,6 +52,17 @@ export type LoadedModel = {
 
 /** Screen-space radius, in CSS pixels, within which an OBJ vertex snaps. */
 const MESH_SNAP_RADIUS_PX = 14;
+
+export type Projection = "perspective" | "orthographic";
+
+/**
+ * Vertical field of view. The library default of 60° is a wide-angle lens:
+ * usable for games, wrong for inspecting a building, where it visibly stretches
+ * anything away from the frame centre. Architectural viewers sit around 35–45°.
+ */
+export const DEFAULT_FOV = 35;
+export const MIN_FOV = 15;
+export const MAX_FOV = 80;
 
 // Result of a snap-aware pick: world point (snapped to a vertex when one is
 // in range, else the raw surface hit), the element it belongs to, and whether
@@ -194,6 +210,11 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const meshModelsRef = useRef<Map<string, MeshModel>>(new Map());
   // Set by the bootstrap effect so loaders outside it can refresh the list.
   const syncModelsRef = useRef<(() => void) | null>(null);
+  // Camera settings survive a projection swap, which replaces `camera.three`.
+  const fovRef = useRef(DEFAULT_FOV);
+  const clipPlanesRef = useRef<ClipPlanes>(
+    clipPlanesForDiagonal(DEFAULT_SCENE_DIAGONAL),
+  );
 
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -222,6 +243,8 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     points: Array<[number, number, number]>;
     elements?: Array<{ modelId: string; localId: number }>;
   } | null>(null);
+  const [projection, setProjectionState] = useState<Projection>("perspective");
+  const [fov, setFovState] = useState(DEFAULT_FOV);
   const [showAllVersion, setShowAllVersion] = useState(0);
   // Active drag-select rectangle (canvas pixel coords). When non-null,
   // Viewport renders an overlay outline. The mouseup handler clears it.
@@ -308,6 +331,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       world.scene.setup();
       world.scene.three.background = new THREE.Color(0x171717);
       world.camera.controls.setLookAt(12, 8, 12, 0, 0, 0);
+      applyCameraSettings(world, fovRef.current, clipPlanesRef.current);
 
       const grids = components.get(OBC.Grids);
       grids.create(world);
@@ -388,6 +412,15 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       // raycast pipelines pick up the active camera; also re-anchor controls.
       const onProjectionChanged = () => {
         const cam = world.camera.three;
+        // The swap hands back a different THREE camera, so fov and clipping
+        // planes have to be re-applied or the new one reverts to library
+        // defaults (60° / near 1) that this viewer deliberately moved away from.
+        applyCameraSettings(world, fovRef.current, clipPlanesRef.current);
+        setProjectionState(
+          (cam as THREE.PerspectiveCamera).isPerspectiveCamera
+            ? "perspective"
+            : "orthographic",
+        );
         for (const [, m] of fragments.list as any) {
           try {
             (m as any).useCamera?.(cam);
@@ -2395,6 +2428,16 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     }
     const controls = (world.camera.controls as any) ?? null;
     if (!controls) return;
+
+    // Clipping planes track the model: this is the one moment we reliably know
+    // how big the scene is, and it runs after every import.
+    const diagonal =
+      hasAny && !merged.isEmpty()
+        ? merged.getSize(new THREE.Vector3()).length()
+        : DEFAULT_SCENE_DIAGONAL;
+    clipPlanesRef.current = clipPlanesForDiagonal(diagonal);
+    applyCameraSettings(world, fovRef.current, clipPlanesRef.current);
+
     if (!hasAny || merged.isEmpty()) {
       try {
         await controls.setLookAt(12, 8, 12, 0, 0, 0, true);
@@ -2410,6 +2453,32 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       await controls.fitToBox(expanded, true);
     } catch (e) {
       console.warn("[viewer] recenter fitToBox failed", e);
+    }
+  }, []);
+
+  /** Vertical field of view in degrees; ignored in orthographic mode. */
+  const setFov = useCallback((degrees: number) => {
+    const clamped = Math.min(Math.max(degrees, MIN_FOV), MAX_FOV);
+    fovRef.current = clamped;
+    setFovState(clamped);
+    const world = worldRef.current;
+    if (!world) return;
+    applyCameraSettings(world, clamped, clipPlanesRef.current);
+    const fragments = fragmentsRef.current;
+    if (fragments?.initialized) fragments.core.update(true);
+  }, []);
+
+  const setProjection = useCallback(async (mode: Projection) => {
+    const world = worldRef.current;
+    const proj: any = (world?.camera as any)?.projection;
+    if (!proj?.set) return;
+    const target = mode === "orthographic" ? "Orthographic" : "Perspective";
+    if (proj.current?.toLowerCase?.() === target.toLowerCase()) return;
+    try {
+      await proj.set(target);
+      // onProjectionChanged re-applies fov/clip planes and syncs React state.
+    } catch (e) {
+      console.warn("[viewer] setProjection failed", e);
     }
   }, []);
 
@@ -2694,6 +2763,10 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     undoPolylinePoint,
     snapEnabled,
     setSnapEnabled,
+    projection,
+    setProjection,
+    fov,
+    setFov,
     captureClips,
     applyClips,
     pendingMeasurement,
@@ -2778,6 +2851,27 @@ function keepScreenSize(mesh: THREE.Mesh, pixelRadius: number) {
     mesh.scale.setScalar(scale);
     mesh.updateMatrixWorld(true);
   };
+}
+
+/**
+ * Push field of view and clipping planes onto whichever THREE camera the
+ * OrthoPerspectiveCamera currently exposes, and keep the dolly limits in step
+ * so the controls cannot drive the target through the near plane.
+ */
+function applyCameraSettings(world: any, fov: number, planes: ClipPlanes) {
+  const camera = world?.camera?.three as THREE.Camera | undefined;
+  if (!camera) return;
+  const perspective = camera as THREE.PerspectiveCamera;
+  if (perspective.isPerspectiveCamera) perspective.fov = fov;
+  (camera as THREE.PerspectiveCamera).near = planes.near;
+  (camera as THREE.PerspectiveCamera).far = planes.far;
+  (camera as any).updateProjectionMatrix?.();
+
+  const controls = world?.camera?.controls;
+  if (controls) {
+    controls.minDistance = planes.minDistance;
+    controls.maxDistance = planes.maxDistance;
+  }
 }
 
 /**

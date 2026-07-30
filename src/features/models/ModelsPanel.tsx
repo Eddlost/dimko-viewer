@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as OBC from "@thatopen/components";
 import { useViewerContext } from "../viewer/ViewerContext";
+import { CameraPanel } from "../viewer/CameraPanel";
 import type { LoadedModel } from "../viewer/useViewer";
 
 type Group = { name: string; items: OBC.ModelIdMap };
@@ -197,13 +198,14 @@ export function ModelsPanel() {
   const { models } = useViewerContext();
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full overflow-y-auto">
+      <CameraPanel />
       <div className="px-3 py-2 border-b border-(--color-border)">
         <span className="text-xs uppercase tracking-wider text-(--color-text-mute)">
           Models
         </span>
       </div>
-      <div className="flex-1 overflow-y-auto">
+      <div>
         {!models.length && (
           <p className="px-3 py-4 text-xs text-(--color-text-mute)">
             No model loaded yet.

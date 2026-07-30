@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import * as THREE from "three";
-import { markerScale, worldPerPixel } from "./screenScale";
+import {
+  clipPlanesForDiagonal,
+  DEFAULT_SCENE_DIAGONAL,
+  markerScale,
+  worldPerPixel,
+} from "./screenScale";
 
 const perspective = (fov = 60) => new THREE.PerspectiveCamera(fov, 1, 0.1, 1000);
 
@@ -36,6 +41,47 @@ describe("worldPerPixel", () => {
 
   it("treats a zero-height viewport as one pixel tall", () => {
     expect(Number.isFinite(worldPerPixel(perspective(), 0, 10))).toBe(true);
+  });
+});
+
+describe("clipPlanesForDiagonal", () => {
+  it("puts the near plane well inside arm's reach for a building", () => {
+    // 60 m building: you must be able to stand at a wall without it vanishing.
+    const { near } = clipPlanesForDiagonal(60);
+    expect(near).toBeLessThan(0.1);
+    expect(near).toBeGreaterThan(0);
+  });
+
+  it("keeps the whole model inside the far plane", () => {
+    for (const diagonal of [5, 60, 500]) {
+      const { far } = clipPlanesForDiagonal(diagonal);
+      expect(far).toBeGreaterThan(diagonal);
+    }
+  });
+
+  it("caps the near plane so huge sites keep depth precision", () => {
+    const { near, far } = clipPlanesForDiagonal(100000);
+    expect(near).toBeLessThanOrEqual(0.5);
+    // Depth precision degrades with the far/near ratio; keep it bounded.
+    expect(far / near).toBeLessThan(1e7);
+  });
+
+  it("never lets the dolly limit push the target through the near plane", () => {
+    for (const diagonal of [1, 50, 5000]) {
+      const { near, minDistance, maxDistance, far } =
+        clipPlanesForDiagonal(diagonal);
+      expect(minDistance).toBeGreaterThan(near);
+      expect(maxDistance).toBeLessThan(far);
+      expect(maxDistance).toBeGreaterThan(minDistance);
+    }
+  });
+
+  it("falls back to the default size for nonsense input", () => {
+    const fallback = clipPlanesForDiagonal(DEFAULT_SCENE_DIAGONAL);
+    expect(clipPlanesForDiagonal(0)).toEqual(fallback);
+    expect(clipPlanesForDiagonal(-1)).toEqual(fallback);
+    expect(clipPlanesForDiagonal(Number.NaN)).toEqual(fallback);
+    expect(clipPlanesForDiagonal(Number.POSITIVE_INFINITY)).toEqual(fallback);
   });
 });
 

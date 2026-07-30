@@ -37,6 +37,44 @@ export function worldPerPixel(
  * sitting exactly on the camera, zero-height viewport) so callers can leave
  * the previous scale alone rather than collapse the object to nothing.
  */
+/** Near/far clipping planes plus the dolly limits that keep them usable. */
+export type ClipPlanes = {
+  near: number;
+  far: number;
+  minDistance: number;
+  maxDistance: number;
+};
+
+/** Assumed model size before anything is loaded, in metres. */
+export const DEFAULT_SCENE_DIAGONAL = 50;
+
+/**
+ * Derive clipping planes from how big the model actually is.
+ *
+ * Fixed planes are the reason geometry vanishes when you zoom in: with
+ * `near = 1` everything within a metre of the camera is sliced away, which
+ * reads as the object being eaten rather than clipped. Tying `near` to the
+ * model's diagonal keeps it far enough to preserve depth precision and close
+ * enough that you can put your nose on a wall.
+ *
+ * The far/near ratio drives depth-buffer precision, so `far` stays a modest
+ * multiple of the model rather than an arbitrary 1000.
+ */
+export function clipPlanesForDiagonal(diagonal: number): ClipPlanes {
+  const size =
+    Number.isFinite(diagonal) && diagonal > 0 ? diagonal : DEFAULT_SCENE_DIAGONAL;
+  const near = Math.min(Math.max(size / 2000, 0.005), 0.5);
+  const far = Math.max(size * 20, 200);
+  return {
+    near,
+    far,
+    // Let the camera come far closer to its target than the old hard 1 m,
+    // while staying outside the near plane so the target never clips.
+    minDistance: near * 10,
+    maxDistance: far * 0.5,
+  };
+}
+
 export function markerScale(
   camera: THREE.Camera,
   viewportHeight: number,
