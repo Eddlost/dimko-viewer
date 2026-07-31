@@ -5,9 +5,12 @@
 // localStorage caps out around 5 MB (and only stores strings, so binary would
 // have to be base64'd — a third bigger again).
 //
-// IFC is stored *parsed*, as fragments bytes, so reopening the page skips the
-// expensive web-ifc pass. OBJ is small and cheap to re-parse, so it is stored
-// as authored.
+// Only IFC is kept, and it is kept *parsed*, as fragments bytes, so reopening
+// the page skips the expensive web-ifc pass. That saving is the whole point of
+// this store, and it is why OBJ is deliberately left out: it re-parses in no
+// time, so persisting it bought nothing and cost clarity — an OBJ from an
+// earlier visit came back on reload and sat in the scene next to the file the
+// user had just opened, which reads as "it loaded my model twice".
 //
 // Everything stays on the user's machine; nothing here talks to a server.
 // ────────────────────────────────────────────────────────────────────────────
@@ -17,7 +20,7 @@ const DB_VERSION = 1;
 const STORE = "models";
 
 /** How the bytes should be fed back to the viewer on restore. */
-export type StoredFormat = "frag" | "obj";
+export type StoredFormat = "frag";
 
 export type StoredModel = {
   id: string;
@@ -73,10 +76,23 @@ export async function saveModel(model: StoredModel): Promise<boolean> {
   }
 }
 
+/**
+ * What is actually on disk, which is not what the current code writes: a
+ * database filled by an older build still holds OBJ entries.
+ */
+type StoredRecord = Omit<StoredModel, "format"> & { format: string };
+
 export async function loadModels(): Promise<StoredModel[]> {
   try {
-    const all = await run<StoredModel[]>("readonly", (store) => store.getAll());
-    return all.sort((a, b) => a.addedAt - b.addedAt);
+    const all = await run<StoredRecord[]>("readonly", (store) => store.getAll());
+    // Evict what older builds stored. Skipping them on read is not enough —
+    // they would linger and reappear the moment this logic moved.
+    for (const model of all) {
+      if (model.format !== "frag") await deleteModel(model.id);
+    }
+    return all
+      .filter((model): model is StoredModel => model.format === "frag")
+      .sort((a, b) => a.addedAt - b.addedAt);
   } catch (e) {
     console.warn("[model-store] load failed", e);
     return [];

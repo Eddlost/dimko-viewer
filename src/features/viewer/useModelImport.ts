@@ -8,10 +8,11 @@ import { requestPersistence, saveModel } from "../../lib/modelStore";
  * upload, no server. IFC is parsed by web-ifc into fragments; OBJ becomes
  * plain three.js geometry.
  *
- * Loaded models are also written to IndexedDB so a reload does not throw the
- * user's work away. IFC is kept in its *parsed* fragments form, which is what
- * makes reopening the page fast — re-running web-ifc on a large model is the
- * slow part, not reading the bytes.
+ * IFC is also written to IndexedDB, in its *parsed* fragments form, so a reload
+ * does not repeat the slow part — re-running web-ifc on a large model, not
+ * reading the bytes. OBJ is not stored: it re-parses instantly, so surviving a
+ * reload gained nothing and only made the scene confusing, with a file from an
+ * earlier visit sitting alongside the one just opened.
  */
 export function useModelImport() {
   const { loadIfcBytes, loadFragBytes, loadObjBytes, recenter } =
@@ -40,7 +41,6 @@ export function useModelImport() {
           }
         } else if (format === "obj") {
           await loadObjBytes(bytes, modelId, file.name);
-          await persist(modelId, file.name, "obj", bytes);
         } else {
           await loadFragBytes(bytes, modelId, file.name);
           await persist(modelId, file.name, "frag", bytes);
@@ -69,7 +69,7 @@ export function useModelImport() {
 async function persist(
   id: string,
   name: string,
-  format: "frag" | "obj",
+  format: "frag",
   bytes: Uint8Array,
 ) {
   // Ask once we actually have something worth keeping, so the browser's

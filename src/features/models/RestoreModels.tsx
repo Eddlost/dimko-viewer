@@ -70,7 +70,9 @@ export function RestoreModels() {
       }
 
       // Linked models are re-fetched from the link every time, so they are
-      // deliberately not in storage; this only brings back dropped files.
+      // deliberately not in storage; this only brings back dropped IFCs. OBJ is
+      // not stored at all, so a dropped OBJ is gone after a reload by design —
+      // see modelStore.
       const stored = await loadModels();
       for (const model of stored) {
         if (cancelled) return;
