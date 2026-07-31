@@ -54,6 +54,22 @@ Matches what people coming from Dalux expect:
 | Wheel | Zooms in on the selected object — the first turn squares the view up on it, then it grows to fill the window. With nothing selected, zooms toward the pointer |
 | Right click | Context menu (isolate, hide, zoom to, section) — no camera movement |
 
+## Sharing a model by link
+
+Add `?model=` to the URL and the viewer loads it on open — no download, no
+drag-and-drop:
+
+```
+https://you.github.io/dimko-viewer/?model=models/kv1.obj
+https://you.github.io/dimko-viewer/?model=models/kv1.obj&model=models/shell.ifc
+```
+
+Relative paths resolve against the app, so dropping files into `public/models/`
+and deploying is enough; absolute URLs work too if the host sends permissive
+CORS headers. Several `model=` entries load in the order given. Linked models
+are fetched from the link every time and are not written to browser storage, so
+reopening the link never duplicates them.
+
 ## Where your files go
 
 Nowhere. There is no account, no upload and no server — the model is parsed by
