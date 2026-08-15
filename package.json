@@ -5,6 +5,16 @@
   "type": "module",
   "license": "MIT",
   "description": "Free, open-source 3D viewer for IFC and OBJ models with measurement tools that are actually precise.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "public/wasm"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -13,7 +23,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
+  "peerDependencies": {
     "@thatopen/components": "^3.4.6",
     "@thatopen/components-front": "^3.4.3",
     "react": "^19.1.0",
@@ -24,6 +34,13 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.0",
+    "@thatopen/components": "^3.4.6",
+    "@thatopen/components-front": "^3.4.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "three": "^0.184.0",
+    "three-viewport-gizmo": "^2.2.0",
+    "web-ifc": "^0.0.77",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@types/three": "^0.184.1",

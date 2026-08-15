@@ -67,3 +67,18 @@ export function saveCameraSettings(settings: CameraSettings) {
     /* quota or private mode — preferences just won't stick */
   }
 }
+
+/**
+ * Where camera preferences live. The free viewer keeps them in localStorage;
+ * an embedder with its own settings file (a project manifest, say) supplies its
+ * own store, or passes `null` to the viewer to not persist at all.
+ */
+export type CameraSettingsStore = {
+  load: () => CameraSettings | null;
+  save: (settings: CameraSettings) => void;
+};
+
+export const localStorageCameraStore: CameraSettingsStore = {
+  load: loadCameraSettings,
+  save: saveCameraSettings,
+};

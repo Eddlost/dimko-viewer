@@ -26,10 +26,12 @@ import {
   type ClipPlanes,
 } from "./screenScale";
 import {
-  loadCameraSettings,
-  saveCameraSettings,
+  localStorageCameraStore,
+  DEFAULT_CAMERA_SETTINGS,
   MAX_FOV,
   MIN_FOV,
+  type CameraSettings,
+  type CameraSettingsStore,
   type Projection,
 } from "../../lib/cameraSettings";
 import {
@@ -70,7 +72,7 @@ export type { Projection } from "../../lib/cameraSettings";
 // Result of a snap-aware pick: world point (snapped to a vertex when one is
 // in range, else the raw surface hit), the element it belongs to, and whether
 // the point actually snapped to a vertex (drives the hover reticle colour).
-type SnapResult = {
+export type SnapResult = {
   point: THREE.Vector3;
   localId: number;
   modelId: string | undefined;
@@ -145,7 +147,53 @@ export type VisibilityMap = Record<string, number[]>;
 
 export type { VisibilitySnapshotEntry } from "./visibility";
 
-export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) {
+/** The axes getModelGroups always returns; providers add their own alongside. */
+export type ModelGroups = {
+  storeys: Array<{ name: string; items: OBC.ModelIdMap }>;
+  categories: Array<{ name: string; items: OBC.ModelIdMap }>;
+} & Record<string, unknown>;
+
+/**
+ * Contributes extra axes to getModelGroups — the seam an embedder uses to hang
+ * its own classification on the tree without the viewer knowing what it is
+ * (DIMKO puts budget items from IFCGROUP here). Returning null adds nothing;
+ * a thrown error is logged and skipped, never breaks the built-in axes.
+ * Providers are called per model on every getModelGroups, so anything
+ * expensive belongs behind the provider's own cache.
+ */
+export type ViewerGroupProvider = (
+  modelId: string,
+  model: any,
+) => Promise<Record<string, unknown> | null> | Record<string, unknown> | null;
+
+export type ViewerOptions = {
+  groupProviders?: ViewerGroupProvider[];
+  /**
+   * Omitted = localStorage (what the free viewer wants). `null` = don't
+   * persist, the embedder owns camera preferences.
+   */
+  cameraStore?: CameraSettingsStore | null;
+  /** Applied when the store has nothing saved. */
+  defaultCamera?: Partial<CameraSettings>;
+  /** Fires after a model leaves the scene, including via clear(). */
+  onModelRemoved?: (modelId: string) => void;
+};
+
+export function useViewer(
+  containerRef: React.RefObject<HTMLDivElement | null>,
+  options?: ViewerOptions,
+) {
+  // Options are read from callbacks and effects that must not re-run when the
+  // caller passes a fresh object literal each render.
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  const cameraStore =
+    options?.cameraStore === undefined
+      ? localStorageCameraStore
+      : options.cameraStore;
+  const cameraStoreRef = useRef(cameraStore);
+  cameraStoreRef.current = cameraStore;
+
   const componentsRef = useRef<OBC.Components | null>(null);
   const worldRef = useRef<any>(null);
   const fragmentsRef = useRef<OBC.FragmentsManager | null>(null);
@@ -224,8 +272,12 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   // Whether the view has already been squared up on the current selection.
   const recentredOnSelectionRef = useRef(false);
   // Camera settings survive a projection swap, which replaces `camera.three`,
-  // and a reload (localStorage).
-  const initialCameraRef = useRef(loadCameraSettings());
+  // and — when a store is configured — a reload.
+  const initialCameraRef = useRef<CameraSettings>({
+    ...DEFAULT_CAMERA_SETTINGS,
+    ...options?.defaultCamera,
+    ...(cameraStore?.load() ?? {}),
+  });
   const fovRef = useRef(initialCameraRef.current.fov);
   const clipPlanesRef = useRef<ClipPlanes>(
     clipPlanesForDiagonal(DEFAULT_SCENE_DIAGONAL),
@@ -1618,7 +1670,9 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
   const clear = useCallback(() => {
     restoreMeshHighlights();
     for (const model of meshModelsRef.current.values()) disposeMeshModel(model);
+    const meshIds = Array.from(meshModelsRef.current.keys());
     meshModelsRef.current.clear();
+    for (const id of meshIds) optionsRef.current?.onModelRemoved?.(id);
 
     const fragments = fragmentsRef.current;
     if (!fragments) {
@@ -1628,6 +1682,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     const ids = Array.from(fragments.list.keys());
     for (const id of ids) {
       fragments.core.disposeModel(id).catch(() => {});
+      optionsRef.current?.onModelRemoved?.(id);
     }
     propertyIndexCache.current.clear();
     setSelection(null);
@@ -1645,6 +1700,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       meshModelsRef.current.delete(modelId);
       displayNamesRef.current.delete(modelId);
       setSelection((prev) => (prev?.modelId === modelId ? null : prev));
+      optionsRef.current?.onModelRemoved?.(modelId);
       syncModelsRef.current?.();
       return;
     }
@@ -1664,6 +1720,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       selectionMapRef.current = next;
       setSelectionMap(next);
     }
+    optionsRef.current?.onModelRemoved?.(modelId);
     if (fragments.initialized) fragments.core.update(true);
   }, [restoreMeshHighlights]);
 
@@ -2370,7 +2427,9 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
     [bumpRuntimeVisibility, pruneSelection, restoreModelElements],
   );
 
-  const getModelGroups = useCallback(async (modelId: string) => {
+  const getModelGroups = useCallback(async (
+    modelId: string,
+  ): Promise<ModelGroups | null> => {
     const components = componentsRef.current;
     const fragments = fragmentsRef.current;
     if (!components || !fragments?.list.get(modelId)) return null;
@@ -2427,7 +2486,20 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
       }
     }
 
-    return { storeys, categories };
+    // Embedder axes last: they may only add, never replace storeys/categories.
+    const providers = optionsRef.current?.groupProviders ?? [];
+    if (!providers.length) return { storeys, categories };
+    const model = fragments.list.get(modelId);
+    let extra: Record<string, unknown> = {};
+    for (const provider of providers) {
+      try {
+        const part = await provider(modelId, model);
+        if (part) extra = { ...extra, ...part };
+      } catch (e) {
+        console.error("[viewer] group provider failed", modelId, e);
+      }
+    }
+    return { ...extra, storeys, categories };
   }, []);
 
   const getItemData = useCallback(
@@ -2713,7 +2785,7 @@ export function useViewer(containerRef: React.RefObject<HTMLDivElement | null>) 
 
   // Remember how the user likes to look at models.
   useEffect(() => {
-    saveCameraSettings({ projection, fov });
+    cameraStoreRef.current?.save({ projection, fov });
   }, [projection, fov]);
 
   const setProjection = useCallback(async (mode: Projection) => {
