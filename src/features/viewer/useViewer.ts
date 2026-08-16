@@ -19,6 +19,14 @@ import {
   faceSnapCandidates,
   sectionSnapCandidates,
 } from "./meshSnap";
+import { insideClipPlanes } from "./clipping";
+import {
+  IFC_STOREY_SOURCE,
+  detectStoreySourceCandidates,
+  storeysFromCatalog,
+  type StoreySource,
+  type StoreySourceCandidate,
+} from "./storeySource";
 import {
   clipPlanesForDiagonal,
   markerScale,
@@ -147,10 +155,22 @@ export type VisibilityMap = Record<string, number[]>;
 
 export type { VisibilitySnapshotEntry } from "./visibility";
 
+/**
+ * Why a model asked for property-based storeys but got the IFC axis anyway.
+ * `missing-index` = the property catalog is not built/loaded yet (the axis
+ * comes back once it is); `missing-property` = the catalog has no such
+ * property, i.e. the setting is stale or was never right for this model.
+ * null = no fallback happened.
+ */
+export type StoreyFallback = "missing-index" | "missing-property" | null;
+
 /** The axes getModelGroups always returns; providers add their own alongside. */
 export type ModelGroups = {
   storeys: Array<{ name: string; items: OBC.ModelIdMap }>;
   categories: Array<{ name: string; items: OBC.ModelIdMap }>;
+  /** The source the returned storeys actually came from, after any fallback. */
+  storeySource: StoreySource;
+  storeyFallback: StoreyFallback;
 } & Record<string, unknown>;
 
 /**
@@ -256,6 +276,13 @@ export function useViewer(
   const pickFirstVisibleRef = useRef<((mouse: THREE.Vector2) => Promise<any | null>) | null>(null);
   const displayNamesRef = useRef<Map<string, string>>(new Map());
   const propertyIndexCache = useRef<Map<string, PropertyIndex>>(new Map());
+  // Which property (if any) drives the storeys axis, per model. Absent = the
+  // IFC spatial structure, which is what every model got before this existed.
+  const storeySourcesRef = useRef<Map<string, StoreySource>>(new Map());
+  // Bumped whenever the answer getModelGroups would give changes without the
+  // model list changing. Consumers re-fetch on the callback's identity, so
+  // this is what makes a source switch show up in the tree.
+  const [storeySourceVersion, setStoreySourceVersion] = useState(0);
   // OBJ models, kept beside fragments.list because they are main-thread
   // three.js objects with no fragments counterpart.
   const meshModelsRef = useRef<Map<string, MeshModel>>(new Map());
@@ -593,15 +620,17 @@ export function useViewer(
         return false;
       };
 
+      // Modes that own the left *click* — clip plane placement, distance
+      // measure, volume and polyline point capture. They deliberately do NOT
+      // own the left drag: see onCanvasMove.
+      const inSpecialMode = () =>
+        clipModeRef.current ||
+        measureModeRef.current ||
+        volumeModeRef.current ||
+        polylineModeRef.current;
+
       const onCanvasDown = (e: MouseEvent) => {
         if (e.button !== 0) return;
-        // Skip drag-select when a special mode owns the left click
-        // (clip, distance measure, volume/polyline click capture).
-        const inSpecialMode =
-          clipModeRef.current ||
-          measureModeRef.current ||
-          volumeModeRef.current ||
-          polylineModeRef.current;
         mouseStart.x = e.clientX;
         mouseStart.y = e.clientY;
         mouseStart.lastX = e.clientX;
@@ -621,7 +650,6 @@ export function useViewer(
         // A left press is ambiguous until the pointer moves: click = select,
         // drag = orbit (or rectangle select with shift). Nothing is decided
         // here; onCanvasMove commits once past SELECT_DRAG_THRESHOLD.
-        void inSpecialMode;
       };
 
       const onCanvasMove = (e: MouseEvent) => {
@@ -638,23 +666,22 @@ export function useViewer(
         }
         // Commit the drag intent once the pointer has travelled far enough
         // that this can no longer be a click. Plain drag orbits; shift+drag
-        // draws a selection rectangle. Special modes own the left button
-        // outright, so neither arms while one is active.
-        if (
-          mouseStart.down &&
-          !mouseStart.dragging &&
-          !mouseStart.selecting &&
-          !clipModeRef.current &&
-          !measureModeRef.current &&
-          !volumeModeRef.current &&
-          !polylineModeRef.current
-        ) {
+        // draws a selection rectangle.
+        //
+        // Special modes used to block this entirely, which left the camera
+        // frozen for as long as you were measuring — the left button was the
+        // only orbit control, so a drag did nothing at all. They own the
+        // *click*, not the drag: onCanvasUp already bails out past the
+        // threshold, so orbiting here cannot also drop a measurement point.
+        // Rectangle select stays out, since shift is a modifier those modes
+        // may want and a marquee makes no sense mid-measurement.
+        if (mouseStart.down && !mouseStart.dragging && !mouseStart.selecting) {
           const dist = Math.hypot(
             e.clientX - mouseStart.x,
             e.clientY - mouseStart.y,
           );
           if (dist > SELECT_DRAG_THRESHOLD) {
-            if (mouseStart.shift) {
+            if (mouseStart.shift && !inSpecialMode()) {
               mouseStart.selecting = true;
             } else {
               mouseStart.dragging = true;
@@ -715,9 +742,11 @@ export function useViewer(
       // as the user drags a plane, so holding the references is enough.
       const activeClipPlanes = (): THREE.Plane[] => {
         const clipper = clipperRef.current as any;
-        if (!clipper) return [];
+        if (!clipper || clipper.enabled === false) return [];
         const out: THREE.Plane[] = [];
         for (const plane of clipper.list.values()) {
+          // A disabled plane cuts nothing, so it must not filter picks either.
+          if (plane?.enabled === false) continue;
           if (plane?.three?.isPlane) out.push(plane.three);
         }
         return out;
@@ -756,9 +785,7 @@ export function useViewer(
           .filter((hit) => isObjectVisible(hit.object))
           // Nor does it know about clipping: without this, clicking a section
           // picks the geometry the cut removed, which is not on screen.
-          .filter((hit) =>
-            planes.every((plane) => plane.distanceToPoint(hit.point) >= 0),
-          )
+          .filter((hit) => insideClipPlanes(hit.point, planes))
           .map((hit) => ({
           point: hit.point,
           distance: hit.distance,
@@ -790,10 +817,21 @@ export function useViewer(
           }
         }
         if (!all.length) return null;
-        all.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
+        // Fragments raycast happens worker-side and knows nothing about the
+        // section planes, so the cut-away half comes back as ordinary hits.
+        // Mesh hits are already filtered inside raycastMeshes; re-testing them
+        // costs nothing and keeps the rule in one place for the merged list.
+        const planes = activeClipPlanes();
+        const visible = planes.length
+          ? all.filter((h) => insideClipPlanes(h.point, planes))
+          : all;
+        if (!visible.length) return null;
+        visible.sort(
+          (a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity),
+        );
         // Cache visibility set per model to avoid re-querying for each hit.
         const visibleByModel = new Map<string, Set<number>>();
-        for (const h of all) {
+        for (const h of visible) {
           const mid = h.fragments?.modelId;
           if (!mid) continue;
           let set = visibleByModel.get(mid);
@@ -871,10 +909,19 @@ export function useViewer(
             console.warn("[viewer] raycastWithSnapping failed", err);
           }
         }
-        if (all.length) {
-          all.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
+        // Same blind spot as pickFirstVisible: only the mesh branch knew about
+        // the section planes, so snapping could anchor a measurement to a
+        // vertex the cut removed. Section candidates sit exactly on a plane and
+        // survive on the tolerance inside insideClipPlanes.
+        const unclipped = planes.length
+          ? all.filter((h) => insideClipPlanes(h.point, planes))
+          : all;
+        if (unclipped.length) {
+          unclipped.sort(
+            (a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity),
+          );
           const visibleByModel = new Map<string, Set<number>>();
-          for (const h of all) {
+          for (const h of unclipped) {
             const mid = h.fragments?.modelId;
             if (!mid || !h.point) continue;
             let set = visibleByModel.get(mid);
@@ -1685,6 +1732,7 @@ export function useViewer(
       optionsRef.current?.onModelRemoved?.(id);
     }
     propertyIndexCache.current.clear();
+    storeySourcesRef.current.clear();
     setSelection(null);
     selectionMapRef.current = {};
     setSelectionMap({});
@@ -1693,6 +1741,7 @@ export function useViewer(
   }, [restoreMeshHighlights]);
 
   const removeModel = useCallback(async (modelId: string) => {
+    storeySourcesRef.current.delete(modelId);
     const meshModel = meshModelsRef.current.get(modelId);
     if (meshModel) {
       restoreMeshHighlights();
@@ -2459,21 +2508,47 @@ export function useViewer(
       return { [modelId]: ids };
     };
 
-    const inclusiveStoreys = await buildInclusiveStoreys(
-      fragments.list.get(modelId),
-    );
+    // Storeys axis: a property source when the embedder set one, otherwise
+    // the IFC spatial structure. The property path needs the catalog, which is
+    // built lazily — if it is not in the cache we do NOT build it here (that
+    // is a minutes-long walk and this runs on every tree refresh), we fall
+    // back and report why, so the UI can say so instead of lying.
+    const source = storeySourcesRef.current.get(modelId) ?? IFC_STOREY_SOURCE;
+    let storeys: Array<{ name: string; items: OBC.ModelIdMap }> = [];
+    let storeySource: StoreySource = IFC_STOREY_SOURCE;
+    let storeyFallback: StoreyFallback = null;
 
-    const storeys: Array<{ name: string; items: OBC.ModelIdMap }> = [];
-    if (storeysMap) {
-      for (const [name, data] of storeysMap) {
-        const incIds = inclusiveStoreys.get(name);
-        if (incIds && incIds.size) {
-          storeys.push({ name, items: { [modelId]: incIds } });
-          continue;
+    if (source.kind === "property") {
+      const catalog = propertyIndexCache.current.get(modelId);
+      const derived = catalog
+        ? storeysFromCatalog(catalog, source.name)
+        : null;
+      if (derived) {
+        storeys = derived.map((g) => ({
+          name: g.name,
+          items: { [modelId]: g.ids },
+        }));
+        storeySource = source;
+      } else {
+        storeyFallback = catalog ? "missing-property" : "missing-index";
+      }
+    }
+
+    if (!storeys.length) {
+      const inclusiveStoreys = await buildInclusiveStoreys(
+        fragments.list.get(modelId),
+      );
+      if (storeysMap) {
+        for (const [name, data] of storeysMap) {
+          const incIds = inclusiveStoreys.get(name);
+          if (incIds && incIds.size) {
+            storeys.push({ name, items: { [modelId]: incIds } });
+            continue;
+          }
+          const items = await data.get();
+          const scoped = pickForModel(items);
+          if (scoped) storeys.push({ name, items: scoped });
         }
-        const items = await data.get();
-        const scoped = pickForModel(items);
-        if (scoped) storeys.push({ name, items: scoped });
       }
     }
 
@@ -2488,7 +2563,8 @@ export function useViewer(
 
     // Embedder axes last: they may only add, never replace storeys/categories.
     const providers = optionsRef.current?.groupProviders ?? [];
-    if (!providers.length) return { storeys, categories };
+    const base = { storeys, categories, storeySource, storeyFallback };
+    if (!providers.length) return base;
     const model = fragments.list.get(modelId);
     let extra: Record<string, unknown> = {};
     for (const provider of providers) {
@@ -2499,8 +2575,41 @@ export function useViewer(
         console.error("[viewer] group provider failed", modelId, e);
       }
     }
-    return { ...extra, storeys, categories };
-  }, []);
+    return { ...extra, ...base };
+    // storeySourceVersion is not read here — it exists to give this callback a
+    // new identity when a source changes, which is how consumers know to
+    // re-fetch. See setStoreySource.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeySourceVersion]);
+
+  const getStoreySource = useCallback(
+    (modelId: string): StoreySource =>
+      storeySourcesRef.current.get(modelId) ?? IFC_STOREY_SOURCE,
+    [],
+  );
+
+  /**
+   * Point one model's storeys axis at a property (or back at the IFC spatial
+   * structure with `{ kind: "ifc" }`). Storey *names* change with the source,
+   * so any key the embedder persisted against the old names — hidden groups,
+   * saved views, filter chips — refers to storeys that no longer exist and is
+   * the embedder's to reconcile.
+   */
+  const setStoreySource = useCallback(
+    (modelId: string, source: StoreySource) => {
+      const current =
+        storeySourcesRef.current.get(modelId) ?? IFC_STOREY_SOURCE;
+      const same =
+        current.kind === source.kind &&
+        (source.kind !== "property" ||
+          (current as { name: string }).name === source.name);
+      if (same) return;
+      if (source.kind === "ifc") storeySourcesRef.current.delete(modelId);
+      else storeySourcesRef.current.set(modelId, { ...source });
+      setStoreySourceVersion((v) => v + 1);
+    },
+    [],
+  );
 
   const getItemData = useCallback(
     async (modelId: string, localId: number) => {
@@ -2611,6 +2720,24 @@ export function useViewer(
     [getRawModel],
   );
 
+  /**
+   * Which properties in this model could stand in for the storeys axis, best
+   * first. Builds the property catalog if it is not cached yet, so on a big
+   * model this can take minutes — call it from an explicit user action, never
+   * on load.
+   */
+  const detectStoreySources = useCallback(
+    async (
+      modelId: string,
+      opts?: { onProgress?: (p: BuildProgress) => void; signal?: AbortSignal },
+    ): Promise<StoreySourceCandidate[]> => {
+      const catalog = await getPropertyIndex(modelId, opts);
+      if (!catalog) return [];
+      return detectStoreySourceCandidates(catalog);
+    },
+    [getPropertyIndex],
+  );
+
   const peekPropertyIndex = useCallback(
     (modelId: string): PropertyIndex | null => {
       return propertyIndexCache.current.get(modelId) ?? null;
@@ -2618,9 +2745,19 @@ export function useViewer(
     [],
   );
 
-  const setPropertyIndex = useCallback((modelId: string, idx: PropertyIndex) => {
-    propertyIndexCache.current.set(modelId, idx);
-  }, []);
+  const setPropertyIndex = useCallback(
+    (modelId: string, idx: PropertyIndex) => {
+      propertyIndexCache.current.set(modelId, idx);
+      // A model whose storeys come from a property renders from the IFC axis
+      // until its catalog arrives. On project open the catalog is restored
+      // after the tree has already asked for groups, so without this the
+      // storeys silently stay wrong until something else re-fetches.
+      if (storeySourcesRef.current.get(modelId)?.kind === "property") {
+        setStoreySourceVersion((v) => v + 1);
+      }
+    },
+    [],
+  );
 
   const invalidatePropertyIndex = useCallback((modelId?: string) => {
     if (modelId) propertyIndexCache.current.delete(modelId);
@@ -3099,6 +3236,9 @@ export function useViewer(
     pickAt,
     setModelHidden,
     getModelGroups,
+    getStoreySource,
+    setStoreySource,
+    detectStoreySources,
     getItemData,
     getRawModel,
     getPropertyIndex,

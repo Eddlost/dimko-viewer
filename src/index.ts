@@ -18,6 +18,7 @@ export {
   type ViewerOptions,
   type ViewerGroupProvider,
   type ModelGroups,
+  type StoreyFallback,
   type LoadedModel,
   type SelectionTarget,
   type SnapResult,
@@ -34,6 +35,17 @@ export {
   type ViewerContextValue,
 } from "./features/viewer/ViewerContext";
 export { OrientationGizmo } from "./features/viewer/OrientationGizmo";
+
+export {
+  IFC_STOREY_SOURCE,
+  UNASSIGNED_STOREY_NAME,
+  compareStoreyNames,
+  detectStoreySourceCandidates,
+  storeysFromCatalog,
+  storeyRank,
+  type StoreySource,
+  type StoreySourceCandidate,
+} from "./features/viewer/storeySource";
 
 export {
   computeVisibleIds,
