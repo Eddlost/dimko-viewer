@@ -38,6 +38,9 @@ export function Toolbar() {
     ready,
     models,
     measureMode,
+    areaMode,
+    setAreaMode,
+    finalizeArea,
     setMeasureMode,
     polylineMode,
     setPolylineMode,
@@ -101,6 +104,17 @@ export function Toolbar() {
       />
       {polylineMode && (
         <ToolButton label="Finish" icon="✓" onClick={() => finalizePolyline()} />
+      )}
+      <ToolButton
+        label="Area"
+        icon="▱"
+        active={areaMode}
+        disabled={!hasModels}
+        title="Measure the area of a ring of points (Enter closes it)"
+        onClick={() => setAreaMode(!areaMode)}
+      />
+      {areaMode && (
+        <ToolButton label="Finish" icon="✓" onClick={() => finalizeArea()} />
       )}
       <ToolButton
         label={snapEnabled ? "Snap on" : "Snap off"}

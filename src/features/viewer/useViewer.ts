@@ -20,6 +20,7 @@ import {
   sectionSnapCandidates,
 } from "./meshSnap";
 import { insideClipPlanes, sectionCutPoints } from "./clipping";
+import { fitPlane, planeBasis, polygonArea, projectToFitPlane } from "./area";
 import {
   IFC_STOREY_SOURCE,
   listStoreySourceProperties as listPropertiesFromCatalog,
@@ -269,6 +270,16 @@ export function useViewer(
   const finalizePolylineRef = useRef<(() => void) | null>(null);
   const cancelPolylineRef = useRef<(() => void) | null>(null);
   const undoPolylinePointRef = useRef<(() => void) | null>(null);
+  // Area measurement — click N corners of a ring, finalize on Enter.
+  // Same shape as polyline; what differs is that the ring closes and the
+  // number is m² off a fitted plane rather than a sum of segments.
+  const areaModeRef = useRef(false);
+  const areaPointsRef = useRef<THREE.Vector3[]>([]);
+  const areaObjectsRef = useRef<THREE.Object3D[]>([]);
+  const finalizeAreaRef = useRef<(() => void) | null>(null);
+  const cancelAreaRef = useRef<(() => void) | null>(null);
+  const undoAreaPointRef = useRef<(() => void) | null>(null);
+  const exitAreaRef = useRef<(() => void) | null>(null);
   // Cross-cancel hook: fully exit polyline mode (clear pending + flags) when
   // another left-click mode is enabled. Bound below.
   const exitPolylineRef = useRef<(() => void) | null>(null);
@@ -343,11 +354,20 @@ export function useViewer(
   const [volumePointCount, setVolumePointCount] = useState(0);
   const [polylineMode, setPolylineModeState] = useState(false);
   const [polylinePointCount, setPolylinePointCount] = useState(0);
+  const [areaMode, setAreaModeState] = useState(false);
+  const [areaPointCount, setAreaPointCount] = useState(0);
   const [snapEnabled, setSnapEnabledState] = useState(true);
   // Just-finalized measurement awaiting a user-provided name. The Měření
   // panel watches this and prompts inline. null = nothing pending.
   const [pendingMeasurement, setPendingMeasurement] = useState<{
-    kind: "distance" | "polyline" | "volume-hull" | "volume-pair" | "volume-mesh" | "volume-approx";
+    kind:
+      | "distance"
+      | "polyline"
+      | "area"
+      | "volume-hull"
+      | "volume-pair"
+      | "volume-mesh"
+      | "volume-approx";
     /** Ties the stored row to its scene objects; see removeMeasurementVisual. */
     visualId?: string;
     value: number;
@@ -680,13 +700,15 @@ export function useViewer(
         clipModeRef.current ||
         measureModeRef.current ||
         volumeModeRef.current ||
-        polylineModeRef.current;
+        polylineModeRef.current ||
+        areaModeRef.current;
 
       // Half-drawn measurement: an anchor waiting for its second click, or a
       // chain the user is still adding to.
       const measurementInProgress = () =>
         !!measureAnchorRef.current ||
         polylinePointsRef.current.length > 0 ||
+        areaPointsRef.current.length > 0 ||
         volumePointsRef.current.length > 0;
 
       const onCanvasDown = (e: MouseEvent) => {
@@ -778,6 +800,7 @@ export function useViewer(
           snapEnabledRef.current &&
           (measureModeRef.current ||
             polylineModeRef.current ||
+            areaModeRef.current ||
             clipModeRef.current)
         ) {
           updateSnapHoverRef.current?.(new THREE.Vector2(e.clientX, e.clientY));
@@ -1161,11 +1184,13 @@ export function useViewer(
         rubberBandRef.current = null;
       };
       clearSnapHoverRef.current = clearSnapHover;
-      // Anchor the rubber-band starts from: the last polyline vertex, or the
-      // pending distance-measure anchor. null = nothing to preview a line from.
+      // Anchor the rubber-band starts from: the last polyline or area vertex,
+      // or the pending distance-measure anchor. null = nothing to preview from.
       const rubberBandAnchor = (): THREE.Vector3 | null => {
         if (polylineModeRef.current && polylinePointsRef.current.length)
           return polylinePointsRef.current[polylinePointsRef.current.length - 1];
+        if (areaModeRef.current && areaPointsRef.current.length)
+          return areaPointsRef.current[areaPointsRef.current.length - 1];
         if (measureModeRef.current && measureAnchorRef.current)
           return measureAnchorRef.current;
         return null;
@@ -1182,6 +1207,7 @@ export function useViewer(
             const active =
               measureModeRef.current ||
               polylineModeRef.current ||
+              areaModeRef.current ||
               clipModeRef.current;
             if (!group || !active || !res) {
               clearSnapHover();
@@ -1329,18 +1355,17 @@ export function useViewer(
         // A measurement drawn over the model is picked before the model
         // itself: it is drawn on top, so that is what the user aimed at.
         //
-        // Measure mode stays ON after a measurement closes, so that you can
-        // take the next one without reaching for the toolbar — which means
-        // "not in a mode" is the wrong gate: it would make the measurement you
-        // just drew unclickable, exactly when you want to undo it. The gate is
-        // whether a measurement is half-drawn instead. Mid-chain every click
-        // is a point, no exceptions; between measurements a click that lands
-        // on an existing one selects it.
+        // Inside a measure mode the click belongs to the tool, because the
+        // alternative does not survive contact with an area: its fill is a
+        // large target, so "select when nothing is half-drawn" made the first
+        // corner of a new ring select the measurement underneath instead of
+        // starting the ring. Alt is the way in — it asks for the measurement
+        // explicitly, so there is nothing to guess.
         //
-        // Clip mode is excluded outright: its click means "cut through this
-        // face", it has no in-progress state to distinguish, and a section is
-        // often placed exactly where something was measured.
-        if (!clipModeRef.current && !measurementInProgress()) {
+        // Clip mode never picks: its click means "cut through this face", and
+        // a section is often placed exactly where something was measured.
+        const wantsMeasurement = !inSpecialMode() || e.altKey;
+        if (!clipModeRef.current && wantsMeasurement && !measurementInProgress()) {
           const hitMeasurement = pickMeasurement(mouse);
           if (hitMeasurement) {
             selectMeasurementRef.current?.(hitMeasurement);
@@ -1414,6 +1439,31 @@ export function useViewer(
               polylineObjectsRef.current.push(seg);
             }
             setPolylinePointCount(pts.length);
+            clearSnapHover();
+            if (fragments.initialized) fragments.core.update(true);
+            return;
+          }
+          if (areaModeRef.current) {
+            const snap = snapEnabledRef.current ? await pickSnapped(mouse) : null;
+            const src = snap?.point ?? hit.point;
+            if (!src) return;
+            const point = src.clone();
+            const group = measureGroupRef.current;
+            if (!group) return;
+            const pts = areaPointsRef.current;
+            const prev = pts[pts.length - 1];
+            pts.push(point);
+            const marker = makeAnchorSphere(point);
+            (marker as any).userData.dimkoMeasure = "area-pending";
+            group.add(marker);
+            areaObjectsRef.current.push(marker);
+            if (prev) {
+              const seg = makeSegmentLine(prev, point);
+              (seg as any).userData.dimkoMeasure = "area-pending";
+              group.add(seg);
+              areaObjectsRef.current.push(seg);
+            }
+            setAreaPointCount(pts.length);
             clearSnapHover();
             if (fragments.initialized) fragments.core.update(true);
             return;
@@ -1659,12 +1709,20 @@ export function useViewer(
           finalizePolylineRef.current?.();
           return;
         }
+        if (e.key === "Enter" && areaModeRef.current) {
+          finalizeAreaRef.current?.();
+          return;
+        }
         if (e.key === "Backspace" && volumeModeRef.current && volumePointsRef.current.length) {
           undoVolumePointRef.current?.();
           return;
         }
         if (e.key === "Backspace" && polylineModeRef.current && polylinePointsRef.current.length) {
           undoPolylinePointRef.current?.();
+          return;
+        }
+        if (e.key === "Backspace" && areaModeRef.current && areaPointsRef.current.length) {
+          undoAreaPointRef.current?.();
           return;
         }
         if (e.key === "Delete" || e.key === "Backspace") {
@@ -1688,6 +1746,10 @@ export function useViewer(
           }
           if (polylineModeRef.current) {
             cancelPolylineRef.current?.();
+            return;
+          }
+          if (areaModeRef.current) {
+            cancelAreaRef.current?.();
             return;
           }
           if (measureModeRef.current) {
@@ -2245,7 +2307,10 @@ export function useViewer(
     clipModeRef.current = enabled;
     setClipModeState(enabled);
     clearSnapHoverRef.current?.();
-    if (enabled) exitPolylineRef.current?.();
+    if (enabled) {
+      exitPolylineRef.current?.();
+      exitAreaRef.current?.();
+    }
     // Clip, measure, volume, polyline are mutually exclusive — all consume
     // left-click.
     if (enabled && measureModeRef.current) {
@@ -2291,7 +2356,10 @@ export function useViewer(
       setMeasureModeState(enabled);
       clearSnapHoverRef.current?.();
       if (!enabled) cancelMeasureAnchor();
-      if (enabled) exitPolylineRef.current?.();
+      if (enabled) {
+        exitPolylineRef.current?.();
+        exitAreaRef.current?.();
+      }
       if (enabled && clipModeRef.current) {
         clipModeRef.current = false;
         setClipModeState(false);
@@ -2336,6 +2404,7 @@ export function useViewer(
         clearVolumePending();
       } else {
         exitPolylineRef.current?.();
+        exitAreaRef.current?.();
         // Mutex against measure / clip — both consume left-click.
         if (measureModeRef.current) {
           measureModeRef.current = false;
@@ -2446,6 +2515,7 @@ export function useViewer(
       if (!enabled) {
         clearPolylinePending();
       } else {
+        exitAreaRef.current?.();
         // Mutex against measure / clip / volume — all consume left-click.
         if (measureModeRef.current) {
           measureModeRef.current = false;
@@ -2538,6 +2608,128 @@ export function useViewer(
   cancelPolylineRef.current = cancelPolyline;
   undoPolylinePointRef.current = undoPolylinePoint;
   exitPolylineRef.current = cancelPolyline;
+
+  // ── Area measurement (closed ring, shoelace in its own fitted plane) ──
+  const clearAreaPending = useCallback(() => {
+    const group = measureGroupRef.current;
+    if (group) {
+      for (const o of areaObjectsRef.current) {
+        group.remove(o);
+        disposeObject(o);
+      }
+    }
+    areaObjectsRef.current = [];
+    areaPointsRef.current = [];
+    setAreaPointCount(0);
+  }, []);
+
+  const setAreaMode = useCallback(
+    (enabled: boolean) => {
+      areaModeRef.current = enabled;
+      setAreaModeState(enabled);
+      clearSnapHoverRef.current?.();
+      if (!enabled) {
+        clearAreaPending();
+      } else {
+        exitPolylineRef.current?.();
+        // Mutex against measure / clip / volume — all consume left-click.
+        if (measureModeRef.current) {
+          measureModeRef.current = false;
+          setMeasureModeState(false);
+          cancelMeasureAnchor();
+        }
+        if (clipModeRef.current) {
+          clipModeRef.current = false;
+          setClipModeState(false);
+        }
+        if (volumeModeRef.current) {
+          clearVolumePending();
+          volumeModeRef.current = false;
+          setVolumeModeState(false);
+        }
+      }
+    },
+    [cancelMeasureAnchor, clearAreaPending, clearVolumePending],
+  );
+
+  const undoAreaPoint = useCallback(() => {
+    const group = measureGroupRef.current;
+    const pts = areaPointsRef.current;
+    if (!pts.length) return;
+    pts.pop();
+    // First point drew a marker only; every one after it drew a marker and the
+    // segment reaching it.
+    const popCount = pts.length === 0 ? 1 : 2;
+    for (let i = 0; i < popCount; i++) {
+      const o = areaObjectsRef.current.pop();
+      if (o && group) {
+        group.remove(o);
+        disposeObject(o);
+      }
+    }
+    setAreaPointCount(pts.length);
+    const fragments = fragmentsRef.current;
+    if (fragments?.initialized) fragments.core.update(true);
+  }, []);
+
+  const cancelArea = useCallback(() => {
+    clearAreaPending();
+    areaModeRef.current = false;
+    setAreaModeState(false);
+    clearSnapHoverRef.current?.();
+    const fragments = fragmentsRef.current;
+    if (fragments?.initialized) fragments.core.update(true);
+  }, [clearAreaPending]);
+
+  const finalizeArea = useCallback(() => {
+    const group = measureGroupRef.current;
+    if (!group) return;
+    const pts = areaPointsRef.current;
+    // Two points enclose nothing. Discard rather than storing a 0 m² row.
+    if (pts.length < 3) {
+      clearAreaPending();
+      areaModeRef.current = false;
+      setAreaModeState(false);
+      return;
+    }
+    const picked = pts.map((p) => p.clone());
+    for (const o of areaObjectsRef.current) {
+      group.remove(o);
+      disposeObject(o);
+    }
+    areaObjectsRef.current = [];
+
+    const value = polygonArea(picked);
+    // Draw the flattened ring, not the clicked one: the number is the area of
+    // the projection, and an outline that visibly misses its own corners would
+    // be claiming to measure something else.
+    const flat = projectToFitPlane(picked);
+    const visualId = nextMeasurementId();
+    group.add(makeAreaMeasurement(flat, value, visualId));
+    pushUndo({ kind: "measurement", visualId });
+    setMeasureCount(countMeasurements(group));
+    setPendingMeasurement({
+      kind: "area",
+      visualId,
+      value,
+      unit: "m²",
+      // The points stored are the ones the user actually clicked; the fitted
+      // plane is derivable from them, the clicks are not recoverable from it.
+      points: picked.map((p): [number, number, number] => [p.x, p.y, p.z]),
+    });
+    areaPointsRef.current = [];
+    setAreaPointCount(0);
+    areaModeRef.current = false;
+    setAreaModeState(false);
+    clearSnapHoverRef.current?.();
+    const fragments = fragmentsRef.current;
+    if (fragments?.initialized) fragments.core.update(true);
+  }, [clearAreaPending, pushUndo]);
+
+  finalizeAreaRef.current = finalizeArea;
+  cancelAreaRef.current = cancelArea;
+  undoAreaPointRef.current = undoAreaPoint;
+  exitAreaRef.current = cancelArea;
 
   const setSnapEnabled = useCallback((enabled: boolean) => {
     snapEnabledRef.current = enabled;
@@ -3577,6 +3769,12 @@ export function useViewer(
     finalizePolyline,
     cancelPolyline,
     undoPolylinePoint,
+    areaMode,
+    areaPointCount,
+    setAreaMode,
+    finalizeArea,
+    cancelArea,
+    undoAreaPoint,
     snapEnabled,
     setSnapEnabled,
     projection,
@@ -3884,6 +4082,91 @@ function makePolyline(
   return group;
 }
 
+/**
+ * Finalized area: a translucent filled polygon, its outline, corner dots and
+ * one label carrying the m².
+ *
+ * The fill is built in the ring's own plane so `ShapeGeometry` can triangulate
+ * it — that runs earcut, which handles the concave rings real rooms are (an
+ * L-shaped floor triangulated as a fan would spill outside its own walls).
+ * The result is then rotated back into place by the plane's basis.
+ */
+function makeAreaMeasurement(
+  points: THREE.Vector3[],
+  area: number,
+  measurementId: string,
+): THREE.Object3D {
+  const group = new THREE.Group();
+  (group as any).userData.dimkoMeasure = "measurement";
+  (group as any).userData.measurementId = measurementId;
+
+  const fit = fitPlane(points);
+  if (fit) {
+    const { u, v } = planeBasis(fit.normal);
+    const flat = points.map((p) => {
+      const d = p.clone().sub(fit.origin);
+      return new THREE.Vector2(d.dot(u), d.dot(v));
+    });
+    try {
+      const geometry = new THREE.ShapeGeometry(new THREE.Shape(flat));
+      geometry.applyMatrix4(
+        new THREE.Matrix4().makeBasis(u, v, fit.normal).setPosition(fit.origin),
+      );
+      const fill = new THREE.Mesh(
+        geometry,
+        new THREE.MeshBasicMaterial({
+          color: LINE_COLOR,
+          opacity: 0.18,
+          transparent: true,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
+      );
+      group.add(fill);
+    } catch (e) {
+      // A self-intersecting ring can defeat triangulation. The outline and the
+      // number still stand on their own, so lose the fill rather than the
+      // measurement.
+      console.warn("[viewer] area fill failed", e);
+    }
+  }
+
+  const dotGeo = markerGeometry();
+  const dotMat = new THREE.MeshBasicMaterial({ color: ANCHOR_COLOR });
+  for (const p of points) {
+    const dot = new THREE.Mesh(dotGeo, dotMat);
+    dot.position.copy(p);
+    keepScreenSize(dot, ENDPOINT_PX);
+    group.add(dot);
+  }
+
+  // Closed outline: back to the first corner, which is what separates an area
+  // from a polyline on screen.
+  const outline = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(points),
+    new THREE.LineBasicMaterial({
+      color: LINE_COLOR,
+      linewidth: 2,
+      depthTest: false,
+      transparent: true,
+    }),
+  );
+  outline.renderOrder = 999;
+  group.add(outline);
+
+  const centroid = points
+    .reduce((acc, p) => acc.add(p), new THREE.Vector3())
+    .multiplyScalar(1 / Math.max(points.length, 1));
+  const div = document.createElement("div");
+  div.textContent = formatArea(area);
+  div.style.cssText =
+    "color:#fff;background:rgba(17,24,39,0.85);padding:3px 7px;border-radius:6px;font-size:11px;font-family:system-ui,sans-serif;font-weight:600;border:1px solid rgba(255,107,61,0.5);pointer-events:none;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,0.4);";
+  const label = new CSS2DObject(div);
+  label.position.copy(centroid);
+  group.add(label);
+  return group;
+}
+
 function makeMeasurement(
   a: THREE.Vector3,
   b: THREE.Vector3,
@@ -3934,6 +4217,12 @@ function makeMeasurement(
 function formatDistance(m: number): string {
   if (m >= 1) return `${m.toFixed(3)} m`;
   return `${(m * 1000).toFixed(0)} mm`;
+}
+
+function formatArea(m2: number): string {
+  if (m2 >= 0.01) return `${m2.toFixed(3)} m²`;
+  // A detail measured in centimetres reads as "0.000 m²" otherwise.
+  return `${(m2 * 10_000).toFixed(0)} cm²`;
 }
 
 function formatVolume(m3: number): string {

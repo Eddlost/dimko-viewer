@@ -31,6 +31,7 @@ const STORAGE_KEY = "dimko-viewer-measurements-v1";
 const KIND_LABEL: Record<string, string> = {
   distance: "Distance",
   polyline: "Polyline",
+  area: "Area",
   "volume-mesh": "Volume",
 };
 

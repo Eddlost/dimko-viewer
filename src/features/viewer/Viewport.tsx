@@ -27,6 +27,8 @@ export function Viewport() {
     measureMode,
     polylineMode,
     polylinePointCount,
+    areaMode,
+    areaPointCount,
     selectRect,
     recenter,
   } = useViewerContext();
@@ -174,13 +176,20 @@ export function Viewport() {
         )}
         {measureMode && (
           <span className="px-2 py-1 rounded-md bg-emerald-900/40 text-emerald-300 border border-emerald-700/40">
-            Distance — click start, click end, Esc to exit
+            Distance — click start, click end, Esc to exit, ⌥click a
+            measurement to pick it
           </span>
         )}
         {polylineMode && (
           <span className="px-2 py-1 rounded-md bg-emerald-900/40 text-emerald-300 border border-emerald-700/40">
             Polyline — {polylinePointCount} point(s), Enter to finish,
-            Backspace to undo, Esc to cancel
+            Backspace to undo, Esc to cancel, ⌥click to pick a measurement
+          </span>
+        )}
+        {areaMode && (
+          <span className="px-2 py-1 rounded-md bg-emerald-900/40 text-emerald-300 border border-emerald-700/40">
+            Area — {areaPointCount} corner(s), Enter to close, Backspace to
+            undo, Esc to cancel, ⌥click to pick a measurement
           </span>
         )}
         {clipCount > 0 && !clipMode && (

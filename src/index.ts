@@ -39,6 +39,14 @@ export {
 export { OrientationGizmo } from "./features/viewer/OrientationGizmo";
 
 export {
+  fitPlane,
+  planeBasis,
+  polygonArea,
+  projectToFitPlane,
+  type AreaFit,
+} from "./features/viewer/area";
+
+export {
   IFC_STOREY_SOURCE,
   UNASSIGNED_STOREY_NAME,
   compareStoreyNames,
