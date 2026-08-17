@@ -19,6 +19,8 @@ export {
   type ViewerGroupProvider,
   type ModelGroups,
   type StoreyFallback,
+  type UndoEntry,
+  type UndoneAction,
   type LoadedModel,
   type SelectionTarget,
   type SnapResult,
@@ -40,11 +42,11 @@ export {
   IFC_STOREY_SOURCE,
   UNASSIGNED_STOREY_NAME,
   compareStoreyNames,
-  detectStoreySourceCandidates,
+  listStoreySourceProperties,
   storeysFromCatalog,
   storeyRank,
   type StoreySource,
-  type StoreySourceCandidate,
+  type StoreySourceProperty,
 } from "./features/viewer/storeySource";
 
 export {

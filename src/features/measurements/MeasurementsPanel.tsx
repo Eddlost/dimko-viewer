@@ -7,7 +7,8 @@ function format(value: number, unit: string): string {
 }
 
 export function MeasurementsPanel() {
-  const { measurements, rename, remove, clear, totals } = useMeasurements();
+  const { measurements, rename, remove, clear, totals, selectedId, select } =
+    useMeasurements();
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
@@ -35,12 +36,23 @@ export function MeasurementsPanel() {
             <span className="text-(--color-text-dim)">Polyline</span> in the
             toolbar and click points in the model. With snapping on, clicks lock
             onto corners and edge midpoints.
+            <br />
+            <br />
+            Click a measurement in the model to pick it, then{" "}
+            <span className="text-(--color-text-dim)">Delete</span> to remove
+            just that one. <span className="text-(--color-text-dim)">⌘Z</span>{" "}
+            takes back the last step.
           </p>
         )}
         {measurements.map((m) => (
           <div
             key={m.id}
-            className="group px-3 py-2 border-b border-(--color-border)/50 hover:bg-(--color-panel-elevated) transition"
+            onClick={() => select(selectedId === m.id ? null : m.id)}
+            className={`group px-3 py-2 border-b border-(--color-border)/50 hover:bg-(--color-panel-elevated) transition ${
+              selectedId === m.id
+                ? "bg-(--color-panel-elevated) border-l-2 border-l-(--color-accent)"
+                : ""
+            }`}
           >
             <div className="flex items-center gap-2">
               {editing === m.id ? (
@@ -73,7 +85,10 @@ export function MeasurementsPanel() {
               )}
               <button
                 type="button"
-                onClick={() => remove(m.id)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  remove(m.id);
+                }}
                 className="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-(--color-danger) text-xs transition"
               >
                 ✕

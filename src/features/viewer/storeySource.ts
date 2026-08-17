@@ -8,9 +8,12 @@
 // the division its users work in. So the source is a per-model setting, with
 // the IFC spatial structure as the default nobody has to opt into.
 //
-// Everything here is pure so the ranking heuristic and the ordering are
-// testable without a model: both are judgement calls that will need tuning
-// against real files, and neither is observable enough to debug by eye.
+// The choice is MANUAL. A scoring heuristic was tried first and did not
+// survive contact with a real estimator's IFC — it ranked the wrong property
+// and, worse, hid the right one behind a threshold. Guessing badly is worse
+// than not guessing: the user knows which property they mean, so this module
+// lists every property with the numbers needed to recognise it and stays out
+// of the decision.
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { PropertyCatalog } from "../properties/propertyIndex";
@@ -32,27 +35,16 @@ export const IFC_STOREY_SOURCE: StoreySource = { kind: "ifc" };
  */
 export const UNASSIGNED_STOREY_NAME = "Unassigned";
 
-export type StoreySourceCandidate = {
-  /** Property name as it appears in the Pset. */
+export type StoreySourceProperty = {
+  /** Property name as it appears in the Pset — the value stored as the source. */
   name: string;
-  /** Distinct values — the storeys this source would produce. */
+  /** Distinct values = how many storeys this source would produce. */
   valueCount: number;
   /** Share of the model's elements carrying the property, 0..1. */
   coverage: number;
-  /** Higher = more storey-like. Only meaningful for ranking. */
-  score: number;
-  /** First few values in storey order, for showing the user what they'd get. */
+  /** First few values in storey order, so the user can recognise the axis. */
   sample: string[];
 };
-
-/** A property with fewer values than this is a flag, not a storey division. */
-const MIN_VALUES = 2;
-/** More than this and it is an element-level attribute, not a division. */
-const MAX_VALUES = 60;
-/** Below this share of the model, the axis would hide most of the building. */
-const MIN_COVERAGE = 0.15;
-/** Candidates weaker than this are noise and are not offered at all. */
-const MIN_SCORE = 1;
 
 /** Lowercase and strip diacritics so `Podlaží` matches `podlazi`. */
 function fold(s: string): string {
@@ -62,23 +54,14 @@ function fold(s: string): string {
     .toLowerCase();
 }
 
-const NAME_HINTS =
-  /podlaz|patro|storey|story|level|floor|etage|geschoss|niveau|nadzemi|podzemi/;
-
 /**
  * Czech storey labels: `1.NP`, `2 NP`, `1.PP`. PP (podzemní podlaží) counts
  * downwards, so 1.PP sits below 1.NP and 2.PP below that.
  */
 const CZ_STOREY = /^\s*(-?\d+)\s*[.,]?\s*(np|pp)\b/;
 /** `Level 0`, `Etage -1`, `2. patro`. */
-const WORD_AND_NUMBER = /(podlazi|patro|storey|story|level|floor|etage)\s*(-?\d+)|(-?\d+)\s*[.,]?\s*(podlazi|patro|storey|story|level|floor|etage)/;
-/** A bare number is a plausible level index — weak on its own. */
-const BARE_NUMBER = /^\s*-?\d+([.,]\d+)?\s*$/;
-
-function looksLikeStoreyLabel(value: string): boolean {
-  const v = fold(value);
-  return CZ_STOREY.test(v) || WORD_AND_NUMBER.test(v) || BARE_NUMBER.test(v);
-}
+const WORD_AND_NUMBER =
+  /(podlazi|patro|storey|story|level|floor|etage)\s*(-?\d+)|(-?\d+)\s*[.,]?\s*(podlazi|patro|storey|story|level|floor|etage)/;
 
 /**
  * Sort rank of a storey label, or null when it carries no number to sort by.
@@ -126,50 +109,33 @@ export function compareStoreyNames(a: string, b: string): number {
 }
 
 /**
- * Rank the catalog's properties by how much they look like a storey division,
- * best first. Deliberately generous: the user picks from this list, so a false
- * positive costs a line in a dropdown while a false negative hides the one
- * property they actually needed.
+ * Every property in the catalog, alphabetically, with what it would produce as
+ * a storeys axis. No filtering and no ranking — see the header. The caller
+ * shows this list and the user picks; `coverage` and `sample` are there so the
+ * right one is recognisable at a glance.
  */
-export function detectStoreySourceCandidates(
+export function listStoreySourceProperties(
   catalog: PropertyCatalog,
-): StoreySourceCandidate[] {
+): StoreySourceProperty[] {
   const total = catalog.totalElements;
-  if (!total) return [];
-
-  const out: StoreySourceCandidate[] = [];
+  const out: StoreySourceProperty[] = [];
   for (const [name, entries] of catalog.properties) {
-    if (entries.length < MIN_VALUES || entries.length > MAX_VALUES) continue;
-
+    if (!entries.length) continue;
     // One element can carry the same property from two Psets, so count the
     // union rather than summing the buckets.
     const covered = new Set<number>();
     for (const e of entries) for (const id of e.elementIds) covered.add(id);
-    const coverage = covered.size / total;
-    if (coverage < MIN_COVERAGE) continue;
-
-    const labelled = entries.filter((e) => looksLikeStoreyLabel(e.value)).length;
-    const labelShare = labelled / entries.length;
-
-    // Name is the strongest signal (`rubim_podlazi` is unambiguous), value
-    // shape the next, coverage a tie-breaker. Many distinct values pull down:
-    // 40 of them is more likely a room number than a storey.
-    let score = 0;
-    if (NAME_HINTS.test(fold(name))) score += 3;
-    if (labelShare >= 0.5) score += 2;
-    else if (labelShare > 0) score += labelShare;
-    score += coverage;
-    score -= entries.length / MAX_VALUES;
-    if (score < MIN_SCORE) continue;
-
-    const sample = entries
-      .map((e) => e.value)
-      .sort(compareStoreyNames)
-      .slice(0, 4);
-    out.push({ name, valueCount: entries.length, coverage, score, sample });
+    out.push({
+      name,
+      valueCount: entries.length,
+      coverage: total ? covered.size / total : 0,
+      sample: entries
+        .map((e) => e.value)
+        .sort(compareStoreyNames)
+        .slice(0, 4),
+    });
   }
-
-  out.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  out.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
   return out;
 }
 

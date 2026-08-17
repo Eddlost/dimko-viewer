@@ -123,20 +123,23 @@ export function faceSnapCandidates(hit: THREE.Intersection): SnapCandidate[] {
 }
 
 /**
- * Nearest candidate to the cursor within `thresholdPx`, or null when nothing
- * is close enough (the caller then keeps the raw surface point).
+ * Nearest item to the cursor within `thresholdPx`, or null when nothing is
+ * close enough (the caller then keeps the raw surface point).
+ *
+ * Strictly nearest, so equal screen distances resolve to whichever came first
+ * in the list — that is how callers express priority between kinds of snap.
  */
-export function chooseSnapCandidate(
-  candidates: SnapCandidate[],
+export function nearestOnScreen<T extends { point: THREE.Vector3 }>(
+  items: T[],
   camera: THREE.Camera,
   frame: ScreenFrame,
   thresholdPx: number,
-): SnapCandidate | null {
-  let best: SnapCandidate | null = null;
+): T | null {
+  let best: T | null = null;
   let bestDistance = Infinity;
-  for (const candidate of candidates) {
+  for (const item of items) {
     const screen = projectToScreen(
-      candidate.point,
+      item.point,
       camera,
       frame.width,
       frame.height,
@@ -146,9 +149,18 @@ export function chooseSnapCandidate(
     const dy = screen.y - frame.y;
     const distance = Math.hypot(dx, dy);
     if (distance <= thresholdPx && distance < bestDistance) {
-      best = candidate;
+      best = item;
       bestDistance = distance;
     }
   }
   return best;
+}
+
+export function chooseSnapCandidate(
+  candidates: SnapCandidate[],
+  camera: THREE.Camera,
+  frame: ScreenFrame,
+  thresholdPx: number,
+): SnapCandidate | null {
+  return nearestOnScreen(candidates, camera, frame, thresholdPx);
 }

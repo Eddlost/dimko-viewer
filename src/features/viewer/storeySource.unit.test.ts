@@ -3,7 +3,7 @@ import type { PropertyCatalog, ValueEntry } from "../properties/propertyIndex";
 import {
   UNASSIGNED_STOREY_NAME,
   compareStoreyNames,
-  detectStoreySourceCandidates,
+  listStoreySourceProperties,
   storeyRank,
   storeysFromCatalog,
 } from "./storeySource";
@@ -79,61 +79,55 @@ describe("compareStoreyNames", () => {
   });
 });
 
-describe("detectStoreySourceCandidates", () => {
-  it("ranks a named storey property above a lookalike", () => {
+describe("listStoreySourceProperties", () => {
+  it("lists every property, alphabetically, with no filtering", () => {
     const c = catalog(
       {
         rubim_podlazi: { "1.PP": [1, 2], "1.NP": [3, 4], "2.NP": [5, 6] },
-        // Same shape, no storey-ish name and no storey-ish values.
         Dodavatel: { Alfa: [1, 2, 3], Beta: [4, 5, 6] },
+        // Jednohodnotová i "moc hodnot" musí zůstat — volba je na userovi.
+        Nosne: { ano: [1, 2, 3, 4, 5, 6] },
       },
       6,
     );
-    const found = detectStoreySourceCandidates(c);
-    expect(found[0].name).toBe("rubim_podlazi");
-    expect(found[0].valueCount).toBe(3);
-    expect(found[0].coverage).toBe(1);
+    expect(listStoreySourceProperties(c).map((p) => p.name)).toEqual([
+      "Dodavatel",
+      "Nosne",
+      "rubim_podlazi",
+    ]);
+  });
+
+  it("reports value count and coverage so the right one is recognisable", () => {
+    const c = catalog({ podlazi: { "1.NP": [1, 2], "2.NP": [3] } }, 6);
+    const [p] = listStoreySourceProperties(c);
+    expect(p.valueCount).toBe(2);
+    expect(p.coverage).toBeCloseTo(0.5);
+  });
+
+  it("counts an element once when two Psets carry the same property", () => {
+    const c = catalog({ podlazi: { "1.NP": [1, 2], "2.NP": [2, 3] } }, 3);
+    expect(listStoreySourceProperties(c)[0].coverage).toBe(1);
   });
 
   it("shows the sample values in storey order", () => {
-    const c = catalog(
-      { podlazi: { "2.NP": [3], "1.PP": [1], "1.NP": [2] } },
-      3,
-    );
-    expect(detectStoreySourceCandidates(c)[0].sample).toEqual([
+    const c = catalog({ podlazi: { "2.NP": [3], "1.PP": [1], "1.NP": [2] } }, 3);
+    expect(listStoreySourceProperties(c)[0].sample).toEqual([
       "1.PP",
       "1.NP",
       "2.NP",
     ]);
   });
 
-  it("rejects a single-valued property — that is a flag, not a division", () => {
-    const c = catalog({ Nosne: { ano: [1, 2, 3, 4] } }, 4);
-    expect(detectStoreySourceCandidates(c)).toEqual([]);
+  it("skips a property with no values at all", () => {
+    const c = catalog({ prazdna: {}, podlazi: { "1.NP": [1] } }, 1);
+    expect(listStoreySourceProperties(c).map((p) => p.name)).toEqual([
+      "podlazi",
+    ]);
   });
 
-  it("rejects a property that barely covers the model", () => {
-    const c = catalog({ podlazi: { "1.NP": [1], "2.NP": [2] } }, 100);
-    expect(detectStoreySourceCandidates(c)).toEqual([]);
-  });
-
-  it("rejects an element-level attribute with too many values", () => {
-    const values: Record<string, number[]> = {};
-    for (let i = 0; i < 80; i++) values[`R${i}`] = [i + 1];
-    expect(detectStoreySourceCandidates(catalog({ Mistnost: values }, 80)))
-      .toEqual([]);
-  });
-
-  it("still offers an unnamed property whose values look like storeys", () => {
-    const c = catalog(
-      { ABC: { "1.NP": [1, 2], "2.NP": [3, 4], "1.PP": [5, 6] } },
-      6,
-    );
-    expect(detectStoreySourceCandidates(c).map((x) => x.name)).toContain("ABC");
-  });
-
-  it("returns nothing for an empty model rather than dividing by zero", () => {
-    expect(detectStoreySourceCandidates(catalog({}, 0))).toEqual([]);
+  it("reports zero coverage instead of dividing by zero on an empty model", () => {
+    const c = catalog({ podlazi: { "1.NP": [1] } }, 0, []);
+    expect(listStoreySourceProperties(c)[0].coverage).toBe(0);
   });
 });
 

@@ -33,3 +33,80 @@ export function insideClipPlanes(
     (plane) => plane.distanceToPoint(point) >= -CLIP_PICK_TOLERANCE,
   );
 }
+
+/** One ray hit reduced to what a cut-face test needs. */
+export type SpanHit = {
+  /** Distance along the ray. */
+  distance: number;
+  modelId?: string;
+  localId?: number;
+};
+
+export type SectionCutPoint = {
+  point: THREE.Vector3;
+  distance: number;
+  modelId?: string;
+  localId?: number;
+};
+
+/**
+ * Where the ray crosses the flat face a section cut opened in an element.
+ *
+ * That face is the one surface a user most wants to measure from, and it is
+ * the one surface that does not exist: the clipper paints it on the GPU, no
+ * triangle is there to hit. So it has to be derived — the ray meets the plane
+ * at one point, and that point is on a real cut face exactly when it lies
+ * *inside* some element, i.e. between that element's near and far hits. An
+ * element the ray only grazes (one hit, no span) has no cut face and is
+ * correctly skipped.
+ *
+ * Points cut away by another plane are dropped; the plane being crossed keeps
+ * its own point via the tolerance in `insideClipPlanes`.
+ */
+export function sectionCutPoints(
+  hits: SpanHit[],
+  planes: THREE.Plane[],
+  ray: THREE.Ray,
+): SectionCutPoint[] {
+  if (!planes.length || hits.length < 2) return [];
+
+  // Near/far hit per element — its extent along this ray.
+  const spans = new Map<
+    string,
+    { min: number; max: number; modelId?: string; localId?: number }
+  >();
+  for (const h of hits) {
+    if (!Number.isFinite(h.distance)) continue;
+    const key = `${h.modelId ?? ""}|${h.localId ?? ""}`;
+    const span = spans.get(key);
+    if (!span) {
+      spans.set(key, {
+        min: h.distance,
+        max: h.distance,
+        modelId: h.modelId,
+        localId: h.localId,
+      });
+      continue;
+    }
+    if (h.distance < span.min) span.min = h.distance;
+    if (h.distance > span.max) span.max = h.distance;
+  }
+
+  const out: SectionCutPoint[] = [];
+  for (const plane of planes) {
+    const t = ray.distanceToPlane(plane);
+    if (t === null || !Number.isFinite(t)) continue;
+    const point = ray.at(t, new THREE.Vector3());
+    if (!insideClipPlanes(point, planes)) continue;
+    for (const span of spans.values()) {
+      if (span.min >= t || t >= span.max) continue;
+      out.push({
+        point: point.clone(),
+        distance: t,
+        modelId: span.modelId,
+        localId: span.localId,
+      });
+    }
+  }
+  return out;
+}

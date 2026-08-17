@@ -15,17 +15,17 @@ import {
   type VisibilitySnapshotEntry,
 } from "./visibility";
 import {
-  chooseSnapCandidate,
   faceSnapCandidates,
+  nearestOnScreen,
   sectionSnapCandidates,
 } from "./meshSnap";
-import { insideClipPlanes } from "./clipping";
+import { insideClipPlanes, sectionCutPoints } from "./clipping";
 import {
   IFC_STOREY_SOURCE,
-  detectStoreySourceCandidates,
+  listStoreySourceProperties as listPropertiesFromCatalog,
   storeysFromCatalog,
   type StoreySource,
-  type StoreySourceCandidate,
+  type StoreySourceProperty,
 } from "./storeySource";
 import {
   clipPlanesForDiagonal,
@@ -163,6 +163,24 @@ export type { VisibilitySnapshotEntry } from "./visibility";
  * null = no fallback happened.
  */
 export type StoreyFallback = "missing-index" | "missing-property" | null;
+
+/**
+ * One step Cmd+Z can take back. `clip` and `measurement` are scene objects the
+ * viewer owns; `point` is a click inside an unfinished measurement, which has
+ * no persisted counterpart at all.
+ */
+export type UndoEntry =
+  | { kind: "measurement"; visualId: string }
+  | { kind: "clip"; planeId: string };
+
+/**
+ * What `undo()` just took back, so the caller can mirror it. A `measurement`
+ * carries the id of the row to drop; `point` and `clip` need no follow-up.
+ */
+export type UndoneAction =
+  | { kind: "measurement"; visualId: string }
+  | { kind: "clip" }
+  | { kind: "point" };
 
 /** The axes getModelGroups always returns; providers add their own alongside. */
 export type ModelGroups = {
@@ -337,9 +355,44 @@ export function useViewer(
     points: Array<[number, number, number]>;
     elements?: Array<{ modelId: string; localId: number }>;
   } | null>(null);
+  // Measurement picked in the viewport, by visualId. The row list lives in the
+  // embedder, so the viewer only reports what the user clicked; deleting the
+  // row is the store's job (it is the only side that knows both).
+  const [selectedMeasurement, setSelectedMeasurementState] = useState<
+    string | null
+  >(null);
+  const selectedMeasurementRef = useRef<string | null>(null);
+  // What Cmd+Z takes back, newest last. Only scene actions the viewer owns
+  // outright go here; anything the embedder persists is undone by returning
+  // its id from undo() and letting the store drop the row.
+  const undoStackRef = useRef<UndoEntry[]>([]);
+  const [canUndo, setCanUndoState] = useState(false);
   const [projection, setProjectionState] = useState<Projection>(
     initialCameraRef.current.projection,
   );
+
+  const pushUndo = useCallback((entry: UndoEntry) => {
+    const stack = undoStackRef.current;
+    stack.push(entry);
+    // A bounded stack: undo is for taking back the last few clicks, not for
+    // replaying a session, and holding ids forever pins nothing useful.
+    if (stack.length > UNDO_LIMIT) stack.shift();
+    setCanUndoState(true);
+  }, []);
+  // The canvas handlers are installed once, before pushUndo exists in their
+  // closure, so they reach it through a ref.
+  const pushUndoRef = useRef(pushUndo);
+  pushUndoRef.current = pushUndo;
+
+  const dropUndoEntries = useCallback(
+    (match: (entry: UndoEntry) => boolean) => {
+      const kept = undoStackRef.current.filter((e) => !match(e));
+      undoStackRef.current = kept;
+      setCanUndoState(kept.length > 0);
+    },
+    [],
+  );
+
   const [fov, setFovState] = useState(initialCameraRef.current.fov);
   const [showAllVersion, setShowAllVersion] = useState(0);
   // Active drag-select rectangle (canvas pixel coords). When non-null,
@@ -629,6 +682,13 @@ export function useViewer(
         volumeModeRef.current ||
         polylineModeRef.current;
 
+      // Half-drawn measurement: an anchor waiting for its second click, or a
+      // chain the user is still adding to.
+      const measurementInProgress = () =>
+        !!measureAnchorRef.current ||
+        polylinePointsRef.current.length > 0 ||
+        volumePointsRef.current.length > 0;
+
       const onCanvasDown = (e: MouseEvent) => {
         if (e.button !== 0) return;
         mouseStart.x = e.clientX;
@@ -760,11 +820,12 @@ export function useViewer(
           height: rect.height,
         };
       };
-      const raycastMeshes = (mouse: THREE.Vector2): any[] => {
-        const models = meshModelsRef.current;
-        if (!models.size) return [];
+      // The cursor ray in world space. Needed on its own (not just as a
+      // by-product of a mesh raycast) because the section-cut snap is computed
+      // from the ray for fragments models too, where no mesh is involved.
+      const cursorRay = (mouse: THREE.Vector2): THREE.Ray | null => {
         const frame = cursorFrame(mouse);
-        if (!frame.width || !frame.height) return [];
+        if (!frame.width || !frame.height) return null;
         meshRaycaster.setFromCamera(
           new THREE.Vector2(
             (frame.x / frame.width) * 2 - 1,
@@ -772,20 +833,27 @@ export function useViewer(
           ),
           world.camera.three,
         );
+        return meshRaycaster.ray.clone();
+      };
+      const raycastMeshes = (mouse: THREE.Vector2): any[] => {
+        const models = meshModelsRef.current;
+        if (!models.size) return [];
+        if (!cursorRay(mouse)) return [];
         const targets: THREE.Object3D[] = [];
         for (const model of models.values()) {
           if (model.object.visible) targets.push(model.object);
         }
         if (!targets.length) return [];
-        const planes = activeClipPlanes();
+        // Section planes are NOT applied here. The callers filter the merged
+        // list instead, because the hits this drops are the ones a section
+        // snap is derived from: a triangle straddling the cut is hit on its
+        // cut-away side, and that is exactly the triangle whose crossing with
+        // the plane is the edge the user wants to measure from.
         return meshRaycaster
           .intersectObjects(targets, true)
           // The raycaster does not consult `visible`, so hidden parts would
           // still be pickable after an isolate or hide.
           .filter((hit) => isObjectVisible(hit.object))
-          // Nor does it know about clipping: without this, clicking a section
-          // picks the geometry the cut removed, which is not on screen.
-          .filter((hit) => insideClipPlanes(hit.point, planes))
           .map((hit) => ({
           point: hit.point,
           distance: hit.distance,
@@ -798,6 +866,42 @@ export function useViewer(
             : undefined,
           meshIntersection: hit,
         }));
+      };
+
+      // Measurement picking is its own raycast: the objects live in a group
+      // hung off the scene, not in any model, and they are thin. Lines need a
+      // world-space threshold to be clickable at all, and the right threshold
+      // depends on how far away the camera is — a fixed one is either
+      // unhittable across a building or grabs everything up close.
+      const measureRaycaster = new THREE.Raycaster();
+      const pickMeasurement = (mouse: THREE.Vector2): string | null => {
+        const group = measureGroupRef.current;
+        if (!group || !group.children.length) return null;
+        const ray = cursorRay(mouse);
+        if (!ray) return null;
+        measureRaycaster.set(ray.origin, ray.direction);
+        const camera = world.camera.three as THREE.Camera;
+        const target = new THREE.Vector3();
+        world.camera.controls?.getTarget?.(target);
+        const span = camera.position.distanceTo(target) || 1;
+        measureRaycaster.params.Line = { threshold: span * MEASURE_PICK_RATIO };
+        measureRaycaster.params.Points = {
+          threshold: span * MEASURE_PICK_RATIO,
+        };
+        const hits = measureRaycaster.intersectObjects(group.children, true);
+        for (const hit of hits) {
+          // Pending markers and the snap reticle are not measurements; walk
+          // up to whichever ancestor carries the id, and ignore hits with
+          // none.
+          let node: THREE.Object3D | null = hit.object;
+          while (node && !(node as any).userData?.measurementId) {
+            node = node.parent;
+            if (node === group) return null;
+          }
+          const id = (node as any)?.userData?.measurementId;
+          if (typeof id === "string") return id;
+        }
+        return null;
       };
 
       const pickFirstVisible = async (mouse: THREE.Vector2): Promise<any | null> => {
@@ -872,83 +976,173 @@ export function useViewer(
       };
       const pickSnapped = async (mouse: THREE.Vector2): Promise<SnapResult | null> => {
         if (!snapEnabledRef.current) return surfaceResult(mouse);
-        // OBJ has no worker-side snapping pipeline — derive candidates from the
-        // hit triangle and pick the one nearest the cursor on screen.
         const planes = activeClipPlanes();
-        const all: any[] = raycastMeshes(mouse).map((hit) => {
-          const face = faceSnapCandidates(hit.meshIntersection);
-          // Vertices win ties, then the section cut, then plain edge midpoints:
-          // a real corner is the most trustworthy thing to measure from, but a
-          // cut edge beats the middle of an uncut edge.
-          const candidate = chooseSnapCandidate(
-            [
-              ...face.filter((c) => c.kind === "vertex"),
-              ...sectionSnapCandidates(hit.meshIntersection, planes),
-              ...face.filter((c) => c.kind === "edge"),
-            ],
-            world.camera.three,
-            cursorFrame(mouse),
-            MESH_SNAP_RADIUS_PX,
-          );
-          return candidate
-            ? { ...hit, point: candidate.point, snappedVertex: true }
-            : hit;
-        });
+        const frame = cursorFrame(mouse);
+        const camera = world.camera.three;
+        const ray = cursorRay(mouse);
+
+        // ── Gather every hit first, unfiltered ──────────────────────────────
+        // Section snapping is derived from hits the cut removed, so filtering
+        // before deriving candidates would throw away the very geometry that
+        // defines the cut. Filtering happens once, on the candidates.
+        const meshHits: any[] = raycastMeshes(mouse);
+        const fragHits: any[] = [];
         for (const [, model] of fragments.list as any) {
           const obj = (model as any)?.object;
           if (obj && obj.visible === false) continue;
           try {
             const hits = await (model as any).raycastWithSnapping?.({
-              camera: world.camera.three,
+              camera,
               mouse,
               dom: canvas,
               snappingClasses: [SNAP_CLASS_POINT],
             });
-            if (hits && hits.length) for (const h of hits) all.push(h);
+            if (hits && hits.length) for (const h of hits) fragHits.push(h);
           } catch (err) {
             console.warn("[viewer] raycastWithSnapping failed", err);
           }
         }
-        // Same blind spot as pickFirstVisible: only the mesh branch knew about
-        // the section planes, so snapping could anchor a measurement to a
-        // vertex the cut removed. Section candidates sit exactly on a plane and
-        // survive on the tolerance inside insideClipPlanes.
-        const unclipped = planes.length
-          ? all.filter((h) => insideClipPlanes(h.point, planes))
-          : all;
-        if (unclipped.length) {
-          unclipped.sort(
-            (a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity),
-          );
-          const visibleByModel = new Map<string, Set<number>>();
-          for (const h of unclipped) {
-            const mid = h.fragments?.modelId;
-            if (!mid || !h.point) continue;
-            let set = visibleByModel.get(mid);
-            if (!set) {
-              try {
-                const vis = await h.fragments.getItemsByVisibility?.(true);
-                set = new Set<number>(Array.isArray(vis) ? vis : []);
-              } catch {
-                set = null as any;
-              }
-              visibleByModel.set(mid, set as any);
-            }
-            if (!set || set.size === 0 || set.has(h.localId)) {
-              return {
-                point: h.point.clone(),
-                localId: h.localId,
-                modelId: mid,
-                normal: h.normal ? h.normal.clone() : undefined,
-                snapped: h.snappedVertex === true || h.snappingClass === SNAP_CLASS_POINT,
-              };
-            }
+        const rawHits = [...meshHits, ...fragHits];
+
+        // ── Build one candidate pool, ordered by priority ───────────────────
+        // Order matters: nearestOnScreen keeps the FIRST of equally distant
+        // candidates, so vertices beat a cut, and a cut beats the middle of an
+        // uncut edge. A real corner is the most trustworthy thing to measure
+        // from; a cut edge is the next most, because the user put it there.
+        type Candidate = {
+          point: THREE.Vector3;
+          distance: number;
+          localId?: number;
+          modelId?: string;
+          normal?: THREE.Vector3;
+        };
+        const vertices: Candidate[] = [];
+        const sections: Candidate[] = [];
+        const edges: Candidate[] = [];
+
+        for (const hit of meshHits) {
+          const base = {
+            distance: hit.distance,
+            localId: hit.localId,
+            modelId: hit.fragments?.modelId,
+            normal: hit.normal,
+          };
+          for (const c of faceSnapCandidates(hit.meshIntersection)) {
+            (c.kind === "vertex" ? vertices : edges).push({
+              ...base,
+              point: c.point,
+            });
+          }
+          for (const c of sectionSnapCandidates(hit.meshIntersection, planes)) {
+            sections.push({ ...base, point: c.point });
           }
         }
-        // No vertex in range — fall back to the surface point so the user
-        // still gets a usable measurement anchor.
-        return surfaceResult(mouse);
+        for (const h of fragHits) {
+          if (!h.point || h.snappingClass !== SNAP_CLASS_POINT) continue;
+          vertices.push({
+            point: h.point,
+            distance: h.distance,
+            localId: h.localId,
+            modelId: h.fragments?.modelId,
+            normal: h.normal,
+          });
+        }
+        // Fragments geometry lives in a worker and comes back without
+        // triangles, so the cut face has to be found from the ray. This is the
+        // only section snap IFC models get — and section snapping on IFC is
+        // most of what a section is used for.
+        if (ray) {
+          for (const cut of sectionCutPoints(
+            rawHits.map((h) => ({
+              distance: h.distance,
+              modelId: h.fragments?.modelId,
+              localId: h.localId,
+            })),
+            planes,
+            ray,
+          )) {
+            sections.push(cut);
+          }
+        }
+
+        // ── Filter, then choose ─────────────────────────────────────────────
+        const visibleByModel = new Map<string, Set<number> | null>();
+        const fragmentsByModel = new Map<string, any>();
+        for (const h of rawHits) {
+          const mid = h.fragments?.modelId;
+          if (mid && !fragmentsByModel.has(mid)) {
+            fragmentsByModel.set(mid, h.fragments);
+          }
+        }
+        const visibleSet = async (mid: string): Promise<Set<number> | null> => {
+          if (visibleByModel.has(mid)) return visibleByModel.get(mid) ?? null;
+          let set: Set<number> | null = null;
+          try {
+            const vis =
+              await fragmentsByModel.get(mid)?.getItemsByVisibility?.(true);
+            set = new Set<number>(Array.isArray(vis) ? vis : []);
+          } catch {
+            // null = couldn't query (no API / no items tracked yet) → trust
+            // the hit rather than dropping every candidate for this model.
+            set = null;
+          }
+          visibleByModel.set(mid, set);
+          return set;
+        };
+        const isPickable = async (c: {
+          point?: THREE.Vector3;
+          modelId?: string;
+          localId?: number;
+        }): Promise<boolean> => {
+          if (!c.point || !insideClipPlanes(c.point, planes)) return false;
+          if (!c.modelId) return true;
+          const set = await visibleSet(c.modelId);
+          if (!set || set.size === 0) return true;
+          return c.localId !== undefined && set.has(c.localId);
+        };
+
+        const pool: Candidate[] = [];
+        for (const c of [...vertices, ...sections, ...edges]) {
+          if (await isPickable(c)) pool.push(c);
+        }
+        const snap = nearestOnScreen(pool, camera, frame, MESH_SNAP_RADIUS_PX);
+        if (snap) {
+          return {
+            point: snap.point.clone(),
+            localId: snap.localId as number,
+            modelId: snap.modelId as string,
+            normal: snap.normal ? snap.normal.clone() : undefined,
+            snapped: true,
+          };
+        }
+
+        // Nothing in range — fall back to the nearest visible surface point so
+        // the user still gets a usable anchor. Reuses the hits already
+        // gathered; running the whole pick again would double the cost of
+        // every hover frame.
+        const surface = rawHits
+          .filter((h) => h.point)
+          .sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
+        for (const h of surface) {
+          if (
+            await isPickable({
+              point: h.point,
+              modelId: h.fragments?.modelId,
+              localId: h.localId,
+            })
+          ) {
+            return {
+              point: h.point.clone(),
+              localId: h.localId,
+              modelId: h.fragments?.modelId,
+              normal: h.normal ? h.normal.clone() : undefined,
+              snapped: false,
+            };
+          }
+        }
+        return null;
       };
+
       pickSnappedRef.current = pickSnapped;
 
       // Hover reticle: while a snap-consuming mode is active, preview the
@@ -1131,6 +1325,32 @@ export function useViewer(
         // held — a slow press must still select.
         if (dist > SELECT_DRAG_THRESHOLD) return;
         const mouse = new THREE.Vector2(e.clientX, e.clientY);
+
+        // A measurement drawn over the model is picked before the model
+        // itself: it is drawn on top, so that is what the user aimed at.
+        //
+        // Measure mode stays ON after a measurement closes, so that you can
+        // take the next one without reaching for the toolbar — which means
+        // "not in a mode" is the wrong gate: it would make the measurement you
+        // just drew unclickable, exactly when you want to undo it. The gate is
+        // whether a measurement is half-drawn instead. Mid-chain every click
+        // is a point, no exceptions; between measurements a click that lands
+        // on an existing one selects it.
+        //
+        // Clip mode is excluded outright: its click means "cut through this
+        // face", it has no in-progress state to distinguish, and a section is
+        // often placed exactly where something was measured.
+        if (!clipModeRef.current && !measurementInProgress()) {
+          const hitMeasurement = pickMeasurement(mouse);
+          if (hitMeasurement) {
+            selectMeasurementRef.current?.(hitMeasurement);
+            await highlighter.clear("select");
+            return;
+          }
+          if (selectedMeasurementRef.current) {
+            selectMeasurementRef.current?.(null);
+          }
+        }
         try {
           const hit: any = await pickFirstVisible(mouse);
           if (!hit || hit.localId === undefined || hit.localId === null) {
@@ -1148,7 +1368,12 @@ export function useViewer(
                 const snap = await pickSnapped(mouse);
                 if (snap?.point) origin = snap.point;
               }
-              clipper.createFromNormalAndCoplanarPoint(world, hit.normal, origin);
+              const planeId = clipper.createFromNormalAndCoplanarPoint(
+                world,
+                hit.normal,
+                origin,
+              );
+              if (planeId) pushUndoRef.current?.({ kind: "clip", planeId });
               setClipCount(clipper.list.size);
             }
             clearSnapHover();
@@ -1219,6 +1444,7 @@ export function useViewer(
               }
               const visualId = nextMeasurementId();
               group.add(makeMeasurement(a, b, visualId));
+              pushUndoRef.current?.({ kind: "measurement", visualId });
               setMeasureCount(countMeasurements(group));
               const distance = a.distanceTo(b);
               setPendingMeasurement({
@@ -1442,11 +1668,20 @@ export function useViewer(
           return;
         }
         if (e.key === "Delete" || e.key === "Backspace") {
+          // A picked measurement owns Delete — but removing it is the
+          // embedder's call, because the scene object is only half of it and
+          // the row is the other half. Bail out so the app's handler runs
+          // instead of this branch wiping every section plane.
+          if (selectedMeasurementRef.current) return;
           if (clipper.list.size) {
             clipper.deleteAll();
             setClipCount(0);
           }
         } else if (e.key === "Escape") {
+          if (selectedMeasurementRef.current) {
+            selectMeasurementRef.current?.(null);
+            return;
+          }
           if (volumeModeRef.current) {
             cancelVolumeRef.current?.();
             return;
@@ -2163,10 +2398,14 @@ export function useViewer(
       return;
     }
     if (built) {
+      const visualId = nextMeasurementId();
+      (built.object as any).userData.measurementId = visualId;
       group.add(built.object);
+      pushUndo({ kind: "measurement", visualId });
       setMeasureCount(countMeasurements(group));
       setPendingMeasurement({
         kind: "volume-hull",
+        visualId,
         value: built.volume,
         unit: "m³",
         points: pts.map((p): [number, number, number] => [p.x, p.y, p.z]),
@@ -2178,7 +2417,7 @@ export function useViewer(
     setVolumeModeState(false);
     const fragments = fragmentsRef.current;
     if (fragments?.initialized) fragments.core.update(true);
-  }, [clearVolumePending]);
+  }, [clearVolumePending, pushUndo]);
 
   // Keep keydown closure refs in sync.
   finalizeVolumeRef.current = finalizeVolume;
@@ -2277,6 +2516,7 @@ export function useViewer(
     for (let i = 1; i < points.length; i++) total += points[i].distanceTo(points[i - 1]);
     const visualId = nextMeasurementId();
     group.add(makePolyline(points, total, visualId));
+    pushUndo({ kind: "measurement", visualId });
     setMeasureCount(countMeasurements(group));
     setPendingMeasurement({
       kind: "polyline",
@@ -2292,7 +2532,7 @@ export function useViewer(
     clearSnapHoverRef.current?.();
     const fragments = fragmentsRef.current;
     if (fragments?.initialized) fragments.core.update(true);
-  }, [clearPolylinePending]);
+  }, [clearPolylinePending, pushUndo]);
 
   finalizePolylineRef.current = finalizePolyline;
   cancelPolylineRef.current = cancelPolyline;
@@ -2305,28 +2545,84 @@ export function useViewer(
     if (!enabled) clearSnapHoverRef.current?.();
   }, []);
 
+  const findMeasurementVisual = useCallback((visualId: string) => {
+    const group = measureGroupRef.current;
+    if (!group) return null;
+    return (
+      group.children.find(
+        (child) => (child as any).userData?.measurementId === visualId,
+      ) ?? null
+    );
+  }, []);
+
+  /**
+   * Highlight the picked measurement so it is obvious which one Delete will
+   * remove. Every measurement builds its own materials, so recolouring one
+   * cannot bleed into another; the original hex is parked on the material and
+   * put back on deselect.
+   */
+  const selectMeasurement = useCallback(
+    (visualId: string | null) => {
+      const previous = selectedMeasurementRef.current;
+      if (previous === visualId) return;
+      if (previous) {
+        const old = findMeasurementVisual(previous);
+        if (old) setMeasurementHighlight(old, false);
+      }
+      if (visualId) {
+        const next = findMeasurementVisual(visualId);
+        if (!next) {
+          selectedMeasurementRef.current = null;
+          setSelectedMeasurementState(null);
+          return;
+        }
+        setMeasurementHighlight(next, true);
+      }
+      selectedMeasurementRef.current = visualId;
+      setSelectedMeasurementState(visualId);
+      const fragments = fragmentsRef.current;
+      if (fragments?.initialized) fragments.core.update(true);
+    },
+    [findMeasurementVisual],
+  );
+  const selectMeasurementRef = useRef(selectMeasurement);
+  selectMeasurementRef.current = selectMeasurement;
+
   /**
    * Drop the objects drawn for one measurement. The panel owns the list, the
    * viewer owns the scene, and `visualId` is the only thing joining them —
    * without this a deleted row leaves its line and label floating in the model.
    */
-  const removeMeasurementVisual = useCallback((visualId: string) => {
-    const group = measureGroupRef.current;
-    if (!group) return;
-    const target = group.children.find(
-      (child) => (child as any).userData?.measurementId === visualId,
-    );
-    if (!target) return;
-    group.remove(target);
-    disposeObject(target);
-    setMeasureCount(countMeasurements(group));
-    const fragments = fragmentsRef.current;
-    if (fragments?.initialized) fragments.core.update(true);
-  }, []);
+  const removeMeasurementVisual = useCallback(
+    (visualId: string) => {
+      const group = measureGroupRef.current;
+      if (!group) return;
+      if (selectedMeasurementRef.current === visualId) {
+        selectedMeasurementRef.current = null;
+        setSelectedMeasurementState(null);
+      }
+      // An object that no longer exists must not be undoable — otherwise the
+      // next Cmd+Z silently consumes a step and appears to do nothing.
+      dropUndoEntries((e) => e.kind === "measurement" && e.visualId === visualId);
+      const target = group.children.find(
+        (child) => (child as any).userData?.measurementId === visualId,
+      );
+      if (!target) return;
+      group.remove(target);
+      disposeObject(target);
+      setMeasureCount(countMeasurements(group));
+      const fragments = fragmentsRef.current;
+      if (fragments?.initialized) fragments.core.update(true);
+    },
+    [dropUndoEntries],
+  );
 
   const deleteAllMeasurements = useCallback(() => {
     const group = measureGroupRef.current;
     if (!group) return;
+    selectedMeasurementRef.current = null;
+    setSelectedMeasurementState(null);
+    dropUndoEntries((e) => e.kind === "measurement");
     cancelMeasureAnchor();
     clearVolumePending();
     clearPolylinePending();
@@ -2339,14 +2635,69 @@ export function useViewer(
     setMeasureCount(0);
     const fragments = fragmentsRef.current;
     if (fragments?.initialized) fragments.core.update(true);
-  }, [cancelMeasureAnchor, clearVolumePending, clearPolylinePending]);
+  }, [
+    cancelMeasureAnchor,
+    clearVolumePending,
+    clearPolylinePending,
+    dropUndoEntries,
+  ]);
+
+  /**
+   * Take back the last thing the user did, newest first.
+   *
+   * An unfinished measurement is undone point by point before the stack is
+   * touched at all: while you are mid-polyline, "back" unambiguously means
+   * "that last click", not "the measurement I finished a minute ago".
+   *
+   * Returns what it undid so the caller can mirror it — a measurement leaves a
+   * row in the embedder's store, and only the store can remove that.
+   */
+  const undo = useCallback((): UndoneAction | null => {
+    if (polylineModeRef.current && polylinePointsRef.current.length) {
+      undoPolylinePointRef.current?.();
+      return { kind: "point" };
+    }
+    if (volumeModeRef.current && volumePointsRef.current.length) {
+      undoVolumePointRef.current?.();
+      return { kind: "point" };
+    }
+    if (measureModeRef.current && measureAnchorRef.current) {
+      cancelMeasureAnchor();
+      return { kind: "point" };
+    }
+
+    const stack = undoStackRef.current;
+    const entry = stack.pop();
+    setCanUndoState(stack.length > 0);
+    if (!entry) return null;
+
+    if (entry.kind === "clip") {
+      const clipper = clipperRef.current;
+      const world = worldRef.current;
+      if (clipper && world) {
+        void (clipper as any)
+          .delete(world, entry.planeId)
+          ?.catch?.((e: any) => console.warn("[viewer] undo clip failed", e));
+        setClipCount(clipper.list.size);
+      }
+      return { kind: "clip" };
+    }
+
+    removeMeasurementVisual(entry.visualId);
+    return { kind: "measurement", visualId: entry.visualId };
+  }, [cancelMeasureAnchor, removeMeasurementVisual]);
 
   const clipFromHit = useCallback(
     (normal: THREE.Vector3, point: THREE.Vector3) => {
       const clipper = clipperRef.current;
       const world = worldRef.current;
       if (!clipper || !world) return;
-      clipper.createFromNormalAndCoplanarPoint(world, normal, point);
+      const planeId = clipper.createFromNormalAndCoplanarPoint(
+        world,
+        normal,
+        point,
+      );
+      if (planeId) pushUndo({ kind: "clip", planeId });
       setClipCount(clipper.list.size);
     },
     [],
@@ -2690,11 +3041,15 @@ export function useViewer(
             centroidAccum.z / centroidCount,
           ]
         : [0, 0, 0];
+      const visualId = nextMeasurementId();
       const visual = makeVolumeLabelVisual(total, centroid);
+      (visual as any).userData.measurementId = visualId;
       group.add(visual);
+      pushUndo({ kind: "measurement", visualId });
       setMeasureCount(countMeasurements(group));
       setPendingMeasurement({
         kind: "volume-mesh",
+        visualId,
         value: total,
         unit: "m³",
         points: [centroid],
@@ -2702,7 +3057,7 @@ export function useViewer(
       });
     }
     return total;
-  }, []);
+  }, [pushUndo]);
 
   const getPropertyIndex = useCallback(
     async (
@@ -2721,19 +3076,19 @@ export function useViewer(
   );
 
   /**
-   * Which properties in this model could stand in for the storeys axis, best
-   * first. Builds the property catalog if it is not cached yet, so on a big
-   * model this can take minutes — call it from an explicit user action, never
-   * on load.
+   * Every property of the model that could serve as the storeys axis, for the
+   * user to pick from. Builds the property catalog if it is not cached yet, so
+   * on a big model this can take minutes — call it from an explicit user
+   * action, never on load.
    */
-  const detectStoreySources = useCallback(
+  const listStoreySourceProperties = useCallback(
     async (
       modelId: string,
       opts?: { onProgress?: (p: BuildProgress) => void; signal?: AbortSignal },
-    ): Promise<StoreySourceCandidate[]> => {
+    ): Promise<StoreySourceProperty[]> => {
       const catalog = await getPropertyIndex(modelId, opts);
       if (!catalog) return [];
-      return detectStoreySourceCandidates(catalog);
+      return listPropertiesFromCatalog(catalog);
     },
     [getPropertyIndex],
   );
@@ -3206,6 +3561,10 @@ export function useViewer(
     setMeasureMode,
     deleteAllMeasurements,
     removeMeasurementVisual,
+    selectedMeasurement,
+    selectMeasurement,
+    undo,
+    canUndo,
     volumeMode,
     volumePointCount,
     setVolumeMode,
@@ -3238,7 +3597,7 @@ export function useViewer(
     getModelGroups,
     getStoreySource,
     setStoreySource,
-    detectStoreySources,
+    listStoreySourceProperties,
     getItemData,
     getRawModel,
     getPropertyIndex,
@@ -3356,6 +3715,44 @@ function applyCameraSettings(world: any, fov: number, planes: ClipPlanes) {
  * Handle tying a stored measurement to the objects drawn for it, so deleting
  * a row in the panel can clear the scene too.
  */
+/** How many steps Cmd+Z can walk back. Enough for a misclick spree, not a log. */
+const UNDO_LIMIT = 50;
+
+/**
+ * Line-pick tolerance as a fraction of the camera's distance to its target.
+ * Scale-relative because a measurement line is one pixel wide at any zoom:
+ * a fixed world threshold is unclickable across a building and grabs half the
+ * scene when you are up against a wall.
+ */
+const MEASURE_PICK_RATIO = 0.004;
+
+/** Colour a picked measurement takes on, so Delete has an obvious target. */
+const MEASURE_SELECT_COLOR = 0xffd166;
+
+/**
+ * Tint (or un-tint) every material under a measurement. The original colour
+ * is parked on the material itself rather than in a side table, so a disposed
+ * object takes its bookkeeping with it.
+ */
+function setMeasurementHighlight(object: THREE.Object3D, on: boolean) {
+  object.traverse((child) => {
+    const material = (child as any).material;
+    if (!material) return;
+    for (const m of Array.isArray(material) ? material : [material]) {
+      if (!m?.color) continue;
+      if (on) {
+        if (m.userData.dimkoMeasureColor === undefined) {
+          m.userData.dimkoMeasureColor = m.color.getHex();
+        }
+        m.color.setHex(MEASURE_SELECT_COLOR);
+      } else if (m.userData.dimkoMeasureColor !== undefined) {
+        m.color.setHex(m.userData.dimkoMeasureColor);
+        delete m.userData.dimkoMeasureColor;
+      }
+    }
+  });
+}
+
 let measurementSeq = 0;
 function nextMeasurementId(): string {
   measurementSeq += 1;

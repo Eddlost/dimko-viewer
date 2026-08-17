@@ -55,6 +55,12 @@ type MeasurementsValue = {
   /** Removes the row and, via `onRemoveVisual`, its objects in the scene. */
   remove: (id: string) => void;
   clear: () => void;
+  /** Row whose objects are picked in the viewport, or null. */
+  selectedId: string | null;
+  /** Picks a row and its objects together — panel and scene stay in step. */
+  select: (id: string | null) => void;
+  /** Deletes the picked row. No-op when nothing is picked. */
+  removeSelected: () => void;
   /** Sum per unit — "how much of this did I measure in total". */
   totals: Record<string, number>;
 };
@@ -70,6 +76,9 @@ export function MeasurementsProvider({ children }: { children: ReactNode }) {
     deleteAllMeasurements,
     pendingMeasurement,
     clearPendingMeasurement,
+    selectedMeasurement,
+    selectMeasurement,
+    undo,
   } = useViewerContext();
   const [measurements, setMeasurements] = useState<Measurement[]>(load);
 
@@ -114,6 +123,69 @@ export function MeasurementsProvider({ children }: { children: ReactNode }) {
     setMeasurements([]);
   }, [deleteAllMeasurements]);
 
+  // Scene picking speaks visualIds, the panel speaks row ids. Map one way here
+  // so neither side has to know about the other's identifiers.
+  const byVisualId = useCallback(
+    (visualId: string | null) =>
+      visualId
+        ? (measurements.find((m) => m.visualId === visualId)?.id ?? null)
+        : null,
+    [measurements],
+  );
+  const selectedId = byVisualId(selectedMeasurement);
+
+  const select = useCallback(
+    (id: string | null) => {
+      const target = id ? measurements.find((m) => m.id === id) : null;
+      // A row restored from localStorage has no objects left in the scene, so
+      // there is nothing to pick — selecting it would light up nothing and
+      // then Delete would look broken.
+      selectMeasurement(target?.visualId ?? null);
+    },
+    [measurements, selectMeasurement],
+  );
+
+  const removeSelected = useCallback(() => {
+    if (selectedId) remove(selectedId);
+  }, [remove, selectedId]);
+
+  // Cmd+Z / Ctrl+Z, anywhere outside a text field. The viewer takes the step
+  // back in the scene and says what it was; a finished measurement also left a
+  // row here, and only this side can remove that.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        const undone = undo();
+        if (undone?.kind === "measurement") {
+          setMeasurements((prev) =>
+            prev.filter((m) => m.visualId !== undone.visualId),
+          );
+        }
+        return;
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (!selectedIdRef.current) return;
+        e.preventDefault();
+        remove(selectedIdRef.current);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [remove, undo]);
+  // The listener is installed once; the current pick reaches it through a ref.
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+
   // Ingest finished measurements here rather than in the panel: the panel is
   // only mounted while its tab is open, so a measurement taken with the models
   // tab showing was drawn in the scene and then never recorded.
@@ -147,8 +219,28 @@ export function MeasurementsProvider({ children }: { children: ReactNode }) {
   }, [measurements]);
 
   const value = useMemo(
-    () => ({ measurements, add, rename, remove, clear, totals }),
-    [add, clear, measurements, remove, rename, totals],
+    () => ({
+      measurements,
+      add,
+      rename,
+      remove,
+      clear,
+      totals,
+      selectedId,
+      select,
+      removeSelected,
+    }),
+    [
+      add,
+      clear,
+      measurements,
+      remove,
+      removeSelected,
+      rename,
+      select,
+      selectedId,
+      totals,
+    ],
   );
 
   return <Context.Provider value={value}>{children}</Context.Provider>;
