@@ -166,12 +166,13 @@ export function MeasurementsProvider({ children }: { children: ReactNode }) {
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
-        const undone = undo();
-        if (undone?.kind === "measurement") {
-          setMeasurements((prev) =>
-            prev.filter((m) => m.visualId !== undone.visualId),
-          );
-        }
+        void undo().then((undone) => {
+          if (undone?.kind === "measurement") {
+            setMeasurements((prev) =>
+              prev.filter((m) => m.visualId !== undone.visualId),
+            );
+          }
+        });
         return;
       }
       if (e.key === "Delete" || e.key === "Backspace") {

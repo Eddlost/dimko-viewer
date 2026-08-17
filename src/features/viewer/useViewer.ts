@@ -172,7 +172,14 @@ export type StoreyFallback = "missing-index" | "missing-property" | null;
  */
 export type UndoEntry =
   | { kind: "measurement"; visualId: string }
-  | { kind: "clip"; planeId: string };
+  | { kind: "clip"; planeId: string }
+  | {
+      kind: "visibility";
+      snapshot: VisibilitySnapshotEntry[];
+      /** Embedder state to put back with the scene — see recordVisibilityUndo. */
+      restore?: () => void | Promise<void>;
+      label?: string;
+    };
 
 /**
  * What `undo()` just took back, so the caller can mirror it. A `measurement`
@@ -181,7 +188,8 @@ export type UndoEntry =
 export type UndoneAction =
   | { kind: "measurement"; visualId: string }
   | { kind: "clip" }
-  | { kind: "point" };
+  | { kind: "point" }
+  | { kind: "visibility"; label?: string };
 
 /** The axes getModelGroups always returns; providers add their own alongside. */
 export type ModelGroups = {
@@ -397,12 +405,34 @@ export function useViewer(
     // A bounded stack: undo is for taking back the last few clicks, not for
     // replaying a session, and holding ids forever pins nothing useful.
     if (stack.length > UNDO_LIMIT) stack.shift();
+    if (entry.kind === "visibility") {
+      // Drop the OLDEST visibility step rather than truncating the stack, so
+      // capping memory never costs a measurement the user could still undo.
+      let extra =
+        stack.filter((e) => e.kind === "visibility").length -
+        VISIBILITY_UNDO_LIMIT;
+      while (extra > 0) {
+        const i = stack.findIndex((e) => e.kind === "visibility");
+        if (i < 0) break;
+        stack.splice(i, 1);
+        extra--;
+      }
+    }
     setCanUndoState(true);
   }, []);
   // The canvas handlers are installed once, before pushUndo exists in their
   // closure, so they reach it through a ref.
   const pushUndoRef = useRef(pushUndo);
   pushUndoRef.current = pushUndo;
+  // Visibility capture/apply live further down the hook; undo and
+  // recordVisibilityUndo reach them through refs rather than being moved
+  // below every visibility helper they would then have to depend on.
+  const captureVisibilitySnapshotRef = useRef<
+    (() => Promise<VisibilitySnapshotEntry[]>) | null
+  >(null);
+  const applyVisibilitySnapshotRef = useRef<
+    ((snapshot: VisibilitySnapshotEntry[]) => Promise<void>) | null
+  >(null);
 
   const dropUndoEntries = useCallback(
     (match: (entry: UndoEntry) => boolean) => {
@@ -2844,7 +2874,7 @@ export function useViewer(
    * Returns what it undid so the caller can mirror it — a measurement leaves a
    * row in the embedder's store, and only the store can remove that.
    */
-  const undo = useCallback((): UndoneAction | null => {
+  const undo = useCallback(async (): Promise<UndoneAction | null> => {
     if (polylineModeRef.current && polylinePointsRef.current.length) {
       undoPolylinePointRef.current?.();
       return { kind: "point" };
@@ -2875,9 +2905,50 @@ export function useViewer(
       return { kind: "clip" };
     }
 
+    if (entry.kind === "visibility") {
+      await applyVisibilitySnapshotRef.current?.(entry.snapshot);
+      // The embedder's half — hidden-group keys in a manifest, panel state —
+      // goes back after the scene, so anything it reads from the viewer sees
+      // the restored state.
+      try {
+        await entry.restore?.();
+      } catch (e) {
+        console.error("[viewer] undo restore hook failed", e);
+      }
+      return { kind: "visibility", label: entry.label };
+    }
+
     removeMeasurementVisual(entry.visualId);
     return { kind: "measurement", visualId: entry.visualId };
   }, [cancelMeasureAnchor, removeMeasurementVisual]);
+
+  /**
+   * Remember the scene's current visibility so Cmd+Z can bring it back, and
+   * bundle whatever the embedder needs restored with it. Call this BEFORE
+   * changing what is visible.
+   *
+   * One call is one undo step. That is deliberate: a single gesture in the
+   * tree can drive several viewer calls, and auto-recording inside each of
+   * them would make one click take four Cmd+Z presses to walk back. The caller
+   * knows where an action begins; the viewer does not.
+   */
+  const recordVisibilityUndo = useCallback(
+    async (opts?: { label?: string; restore?: () => void | Promise<void> }) => {
+      try {
+        const snapshot = await captureVisibilitySnapshotRef.current?.();
+        if (!snapshot) return;
+        pushUndo({
+          kind: "visibility",
+          snapshot,
+          restore: opts?.restore,
+          label: opts?.label,
+        });
+      } catch (e) {
+        console.error("[viewer] recordVisibilityUndo failed", e);
+      }
+    },
+    [pushUndo],
+  );
 
   const clipFromHit = useCallback(
     (normal: THREE.Vector3, point: THREE.Vector3) => {
@@ -3662,6 +3733,9 @@ export function useViewer(
     [bumpRuntimeVisibility, restoreModelElements, setModelExactVisibility],
   );
 
+  captureVisibilitySnapshotRef.current = captureVisibilitySnapshot;
+  applyVisibilitySnapshotRef.current = applyVisibilitySnapshot;
+
   // One-stop capture for saved views: camera + visibility snapshot +
   // selection already filtered to visible elements. Used by the Pohledy
   // panel and the agent's save_view tool so both persist identical state.
@@ -3757,6 +3831,7 @@ export function useViewer(
     selectMeasurement,
     undo,
     canUndo,
+    recordVisibilityUndo,
     volumeMode,
     volumePointCount,
     setVolumeMode,
@@ -3915,6 +3990,15 @@ function applyCameraSettings(world: any, fov: number, planes: ClipPlanes) {
  */
 /** How many steps Cmd+Z can walk back. Enough for a misclick spree, not a log. */
 const UNDO_LIMIT = 50;
+
+/**
+ * Visibility steps are capped harder than the rest. Each one carries a list of
+ * element ids — `chooseSnapshotMode` keeps whichever of visible/hidden is
+ * shorter, but on a large model that is still tens of thousands of numbers, and
+ * fifty of those is real memory. A dozen covers walking back a hiding spree;
+ * beyond that the user reaches for "show all", not Cmd+Z.
+ */
+const VISIBILITY_UNDO_LIMIT = 12;
 
 /**
  * Line-pick tolerance as a fraction of the camera's distance to its target.

@@ -19,6 +19,7 @@ function ModelBlock({ model }: { model: LoadedModel }) {
     setVisibility,
     zoomToSelection,
     showAll,
+    recordVisibilityUndo,
   } = useViewerContext();
 
   const [axes, setAxes] = useState<Axis[]>([]);
@@ -70,6 +71,14 @@ function ModelBlock({ model }: { model: LoadedModel }) {
     async (axisKey: string, group: Group) => {
       const key = `${axisKey}:${group.name}`;
       const nowHidden = !hiddenGroups.has(key);
+      // The checkbox set is this panel's own state, so it rides along with the
+      // scene snapshot — restoring one without the other leaves the ticks
+      // disagreeing with the model.
+      const before = new Set(hiddenGroups);
+      await recordVisibilityUndo({
+        label: nowHidden ? `hide ${group.name}` : `show ${group.name}`,
+        restore: () => setHiddenGroups(before),
+      });
       setHiddenGroups((prev) => {
         const next = new Set(prev);
         if (nowHidden) next.add(key);
@@ -78,7 +87,7 @@ function ModelBlock({ model }: { model: LoadedModel }) {
       });
       await setVisibility(!nowHidden, group.items);
     },
-    [hiddenGroups, setVisibility],
+    [hiddenGroups, recordVisibilityUndo, setVisibility],
   );
 
   return (
@@ -95,6 +104,11 @@ function ModelBlock({ model }: { model: LoadedModel }) {
           type="button"
           onClick={async () => {
             const next = !hidden;
+            const wasHidden = hidden;
+            await recordVisibilityUndo({
+              label: next ? `hide ${model.name}` : `show ${model.name}`,
+              restore: () => setHidden(wasHidden),
+            });
             setHidden(next);
             await setModelHidden(model.id, next);
           }}
@@ -169,6 +183,9 @@ function ModelBlock({ model }: { model: LoadedModel }) {
                       <button
                         type="button"
                         onClick={async () => {
+                          await recordVisibilityUndo({
+                            label: `isolate ${group.name}`,
+                          });
                           await isolate(group.items);
                           await zoomToSelection(group.items);
                         }}
@@ -186,8 +203,14 @@ function ModelBlock({ model }: { model: LoadedModel }) {
           <button
             type="button"
             onClick={() => {
-              setHiddenGroups(new Set());
-              void showAll();
+              const before = new Set(hiddenGroups);
+              void recordVisibilityUndo({
+                label: "show all",
+                restore: () => setHiddenGroups(before),
+              }).then(() => {
+                setHiddenGroups(new Set());
+                return showAll();
+              });
             }}
             className="ml-6 mt-1 text-[10px] text-(--color-text-mute) hover:text-(--color-accent) transition"
           >
