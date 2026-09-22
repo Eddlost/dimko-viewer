@@ -523,7 +523,27 @@ export function useViewer(
       // and any other HTML-overlay components. Plain OBC.SimpleRenderer
       // would render the WebGL but never mount the DOM markers, so the
       // measurement looked like "snap doesn't work".
-      world.renderer = new OBF.RendererWith2D(components, container);
+      world.renderer = new OBF.RendererWith2D(components, container, {
+        // A building's layers are millimetres apart inside a scene tens of
+        // metres across, and the default depth buffer cannot tell them apart
+        // at viewing distance. clipPlanesForDiagonal keeps far/near at 40 000,
+        // which leaves roughly z²/(near·2²⁴) of depth resolution: about 3 mm
+        // at 50 m and 12 mm at 100 m. A 2 mm screed over a slab therefore
+        // z-fights, and which surface wins changes as the camera moves —
+        // the flicker reads as the lower layer punching through the upper one.
+        // A logarithmic buffer spends its precision evenly across the range
+        // instead of hoarding it next to the near plane.
+        //
+        // Measured on a 46 000-item, 109 m building (OLOW budget model): no
+        // difference in frame time, including at 4x pixel ratio, because the
+        // scene is nowhere near fill-bound. Re-measure if that stops being
+        // true on the Windows site laptops.
+        //
+        // This does not fix genuinely coplanar faces — a wall face and its
+        // finish modelled at the same coordinate is a defect in the model, and
+        // no depth precision separates them.
+        logarithmicDepthBuffer: true,
+      });
       // RendererWith2D.setupHtmlRenderer forces `container.style.position`
       // to "relative" so it can append a CSS2D layer absolutely-positioned
       // inside. That clobbers our Tailwind `absolute inset-0` layout —
