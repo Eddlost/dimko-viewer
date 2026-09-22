@@ -21,6 +21,7 @@ import {
 } from "./meshSnap";
 import { insideClipPlanes, sectionCutPoints } from "./clipping";
 import { createSerialQueue } from "./opQueue";
+import { previewForClick } from "./snapPlacement";
 import { fitPlane, planeBasis, polygonArea, projectToFitPlane } from "./area";
 import {
   IFC_STOREY_SOURCE,
@@ -76,18 +77,30 @@ export type LoadedModel = {
 
 /** Screen-space radius, in CSS pixels, within which an OBJ vertex snaps. */
 const MESH_SNAP_RADIUS_PX = 14;
+// How far the cursor may travel from the previewed point and still place it.
+// Small on purpose: past this the reticle no longer describes the click.
+const PLACE_FROM_RETICLE_PX = 3;
 
 export type { Projection } from "../../lib/cameraSettings";
 
 // Result of a snap-aware pick: world point (snapped to a vertex when one is
 // in range, else the raw surface hit), the element it belongs to, and whether
 // the point actually snapped to a vertex (drives the hover reticle colour).
+/**
+ * What a snapped point actually latched onto. `snapped` stays a boolean for
+ * compatibility, but it cannot answer the question that matters when a point
+ * lands somewhere unexpected: a corner and a grazing surface hit look the
+ * same, so the user has no way to tell a trustworthy point from a guess.
+ */
+export type SnapKind = "vertex" | "section" | "edge" | "surface";
+
 export type SnapResult = {
   point: THREE.Vector3;
   localId: number;
   modelId: string | undefined;
   normal?: THREE.Vector3;
   snapped: boolean;
+  kind: SnapKind;
 };
 
 // SnappingClass.POINT from @thatopen/fragments. The enum lives in the
@@ -302,6 +315,17 @@ export function useViewer(
   const snapHoverRef = useRef<THREE.Object3D | null>(null);
   const snapHoverInFlightRef = useRef(false);
   const snapHoverLastRef = useRef(0);
+  // The point the reticle is currently promising, and the cursor position it
+  // was computed for. A click consumes this instead of picking again: the
+  // reticle comes from a throttled, in-flight-guarded pick, so a fresh pick at
+  // click time can resolve to a different vertex than the one on screen — the
+  // snap pool is ordered by screen distance within 14 px, and three pixels of
+  // cursor travel are enough to change the winner. Re-picking made the reticle
+  // a guess about where the point would go; consuming it makes it a promise.
+  const snapPreviewRef = useRef<{
+    mouse: THREE.Vector2;
+    result: SnapResult;
+  } | null>(null);
   // Live preview segment from the last placed point to the cursor while
   // drawing a polyline / distance measure.
   const rubberBandRef = useRef<THREE.Line | null>(null);
@@ -1033,6 +1057,7 @@ export function useViewer(
           modelId: hit.fragments?.modelId,
           normal: hit.normal ? hit.normal.clone() : undefined,
           snapped: false,
+          kind: "surface",
         };
       };
       const pickSnapped = async (mouse: THREE.Vector2): Promise<SnapResult | null> => {
@@ -1076,6 +1101,7 @@ export function useViewer(
           localId?: number;
           modelId?: string;
           normal?: THREE.Vector3;
+          kind: SnapKind;
         };
         const vertices: Candidate[] = [];
         const sections: Candidate[] = [];
@@ -1089,13 +1115,15 @@ export function useViewer(
             normal: hit.normal,
           };
           for (const c of faceSnapCandidates(hit.meshIntersection)) {
-            (c.kind === "vertex" ? vertices : edges).push({
+            const vertex = c.kind === "vertex";
+            (vertex ? vertices : edges).push({
               ...base,
               point: c.point,
+              kind: vertex ? "vertex" : "edge",
             });
           }
           for (const c of sectionSnapCandidates(hit.meshIntersection, planes)) {
-            sections.push({ ...base, point: c.point });
+            sections.push({ ...base, point: c.point, kind: "section" });
           }
         }
         for (const h of fragHits) {
@@ -1106,6 +1134,7 @@ export function useViewer(
             localId: h.localId,
             modelId: h.fragments?.modelId,
             normal: h.normal,
+            kind: "vertex",
           });
         }
         // Fragments geometry lives in a worker and comes back without
@@ -1122,7 +1151,7 @@ export function useViewer(
             planes,
             ray,
           )) {
-            sections.push(cut);
+            sections.push({ ...cut, kind: "section" });
           }
         }
 
@@ -1174,6 +1203,7 @@ export function useViewer(
             modelId: snap.modelId as string,
             normal: snap.normal ? snap.normal.clone() : undefined,
             snapped: true,
+            kind: snap.kind,
           };
         }
 
@@ -1198,6 +1228,7 @@ export function useViewer(
               modelId: h.fragments?.modelId,
               normal: h.normal ? h.normal.clone() : undefined,
               snapped: false,
+              kind: "surface",
             };
           }
         }
@@ -1215,6 +1246,7 @@ export function useViewer(
           disposeObject(snapHoverRef.current);
         }
         snapHoverRef.current = null;
+        snapPreviewRef.current = null;
         if (rubberBandRef.current && group) {
           group.remove(rubberBandRef.current);
           disposeObject(rubberBandRef.current);
@@ -1250,12 +1282,13 @@ export function useViewer(
             if (!group || !active || !res) {
               clearSnapHover();
             } else {
+              snapPreviewRef.current = { mouse: mouse.clone(), result: res };
               if (!snapHoverRef.current) {
-                snapHoverRef.current = makeSnapReticle(res.point, res.snapped);
+                snapHoverRef.current = makeSnapReticle(res.point, res.kind);
                 group.add(snapHoverRef.current);
               } else {
                 snapHoverRef.current.position.copy(res.point);
-                applyReticleColor(snapHoverRef.current, res.snapped);
+                applyReticleColor(snapHoverRef.current, res.kind);
               }
               // Rubber-band: live segment from the last placed point to the
               // cursor so the user sees the line they're drawing.
@@ -1282,6 +1315,26 @@ export function useViewer(
           });
       };
       updateSnapHoverRef.current = updateSnapHover;
+
+      /**
+       * The point a click places.
+       *
+       * Prefers whatever the reticle is currently showing, so what the user
+       * aimed at is what lands. Only when the cursor has moved off that
+       * position — or nothing was previewed — does it pick afresh, because
+       * then the reticle was not describing this click anyway.
+       */
+      const pickForPlacement = async (
+        mouse: THREE.Vector2,
+      ): Promise<SnapResult | null> => {
+        if (!snapEnabledRef.current) return null;
+        const previewed = previewForClick(
+          snapPreviewRef.current,
+          mouse,
+          PLACE_FROM_RETICLE_PX,
+        );
+        return previewed ?? pickSnapped(mouse);
+      };
 
       const onCanvasUp = async (e: MouseEvent) => {
         if (e.button !== 0) return;
@@ -1428,7 +1481,7 @@ export function useViewer(
               // align to corners/edges.
               let origin = hit.point.clone();
               if (snapEnabledRef.current) {
-                const snap = await pickSnapped(mouse);
+                const snap = await pickForPlacement(mouse);
                 if (snap?.point) origin = snap.point;
               }
               const planeId = clipper.createFromNormalAndCoplanarPoint(
@@ -1457,7 +1510,7 @@ export function useViewer(
             return;
           }
           if (polylineModeRef.current) {
-            const snap = snapEnabledRef.current ? await pickSnapped(mouse) : null;
+            const snap = await pickForPlacement(mouse);
             const src = snap?.point ?? hit.point;
             if (!src) return;
             const point = src.clone();
@@ -1482,7 +1535,7 @@ export function useViewer(
             return;
           }
           if (areaModeRef.current) {
-            const snap = snapEnabledRef.current ? await pickSnapped(mouse) : null;
+            const snap = await pickForPlacement(mouse);
             const src = snap?.point ?? hit.point;
             if (!src) return;
             const point = src.clone();
@@ -1507,7 +1560,7 @@ export function useViewer(
             return;
           }
           if (measureModeRef.current) {
-            const snap = snapEnabledRef.current ? await pickSnapped(mouse) : null;
+            const snap = await pickForPlacement(mouse);
             const src = snap?.point ?? hit.point;
             if (!src) return;
             const point = src.clone();
@@ -2928,6 +2981,10 @@ export function useViewer(
       undoVolumePointRef.current?.();
       return { kind: "point" };
     }
+    if (areaModeRef.current && areaPointsRef.current.length) {
+      undoAreaPointRef.current?.();
+      return { kind: "point" };
+    }
     if (measureModeRef.current && measureAnchorRef.current) {
       cancelMeasureAnchor();
       return { kind: "point" };
@@ -3968,8 +4025,26 @@ const ANCHOR_COLOR = 0xff6b3d;
 const LINE_COLOR = 0xff6b3d;
 // Reticle colours: cyan when locked onto a vertex, dim grey when riding a
 // plain surface point.
+// One colour per kind of snap. A point on a corner and a point on a grazing
+// surface used to look identical, so an unexpected placement gave the user
+// nothing to learn from.
 const SNAP_VERTEX_COLOR = 0x22d3ee;
+const SNAP_SECTION_COLOR = 0xffd166;
+const SNAP_EDGE_COLOR = 0x7dd3fc;
 const SNAP_SURFACE_COLOR = 0x94a3b8;
+
+function snapColor(kind: SnapKind): number {
+  switch (kind) {
+    case "vertex":
+      return SNAP_VERTEX_COLOR;
+    case "section":
+      return SNAP_SECTION_COLOR;
+    case "edge":
+      return SNAP_EDGE_COLOR;
+    default:
+      return SNAP_SURFACE_COLOR;
+  }
+}
 
 // On-screen radii, in CSS pixels, of the measurement markers. They are held
 // constant by keepScreenSize below.
@@ -4121,9 +4196,9 @@ function makeAnchorSphere(point: THREE.Vector3): THREE.Object3D {
 }
 
 // Small always-on-top reticle previewing where the next click lands.
-function makeSnapReticle(point: THREE.Vector3, snapped: boolean): THREE.Object3D {
+function makeSnapReticle(point: THREE.Vector3, kind: SnapKind): THREE.Object3D {
   const mat = new THREE.MeshBasicMaterial({
-    color: snapped ? SNAP_VERTEX_COLOR : SNAP_SURFACE_COLOR,
+    color: snapColor(kind),
     depthTest: false,
     transparent: true,
     opacity: 0.95,
@@ -4136,9 +4211,9 @@ function makeSnapReticle(point: THREE.Vector3, snapped: boolean): THREE.Object3D
   return mesh;
 }
 
-function applyReticleColor(obj: THREE.Object3D, snapped: boolean) {
+function applyReticleColor(obj: THREE.Object3D, kind: SnapKind) {
   const mat = (obj as THREE.Mesh).material as THREE.MeshBasicMaterial | undefined;
-  if (mat?.color) mat.color.setHex(snapped ? SNAP_VERTEX_COLOR : SNAP_SURFACE_COLOR);
+  if (mat?.color) mat.color.setHex(snapColor(kind));
 }
 
 // Dashed live segment from the last placed point to the cursor (preview only).
