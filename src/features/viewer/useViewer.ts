@@ -20,6 +20,7 @@ import {
   sectionSnapCandidates,
 } from "./meshSnap";
 import { insideClipPlanes, sectionCutPoints } from "./clipping";
+import { createSerialQueue } from "./opQueue";
 import { fitPlane, planeBasis, polygonArea, projectToFitPlane } from "./area";
 import {
   IFC_STOREY_SOURCE,
@@ -463,6 +464,13 @@ export function useViewer(
     () => setRuntimeVisibilityVersion((v) => v + 1),
     [],
   );
+  // Every public visibility operation runs through here, one at a time. Each
+  // of them is a multi-step exchange with the fragments worker, and two in
+  // flight at once interleave their steps — see opQueue.ts for the two bugs
+  // that came of it. The `*Raw` functions below are the unqueued bodies;
+  // composite operations call those, never the queued wrappers, so a queued
+  // task can never wait on the queue.
+  const visibilityQueue = useRef(createSerialQueue()).current;
   // Isolation root = sticky subset for downstream operations (e.g. property
   // filter "Izolovat" sets this so tree-driven storey toggles intersect with
   // it instead of resetting). Stored as Record<modelId, Set<localId>>.
@@ -2100,7 +2108,7 @@ export function useViewer(
     if (fragments.initialized) fragments.core.update(true);
   }, [restoreMeshHighlights]);
 
-  const setVisibility = useCallback(async (visible: boolean, items?: OBC.ModelIdMap) => {
+  const setVisibilityRaw = useCallback(async (visible: boolean, items?: OBC.ModelIdMap) => {
     setMeshPartsVisible(meshModelsRef.current, visible, items as any);
     const hider = hiderRef.current;
     if (!hider) {
@@ -2110,6 +2118,12 @@ export function useViewer(
     await hider.set(visible, items);
     bumpRuntimeVisibility();
   }, [bumpRuntimeVisibility]);
+
+  const setVisibility = useCallback(
+    (visible: boolean, items?: OBC.ModelIdMap) =>
+      visibilityQueue.run(() => setVisibilityRaw(visible, items)),
+    [setVisibilityRaw, visibilityQueue],
+  );
 
   // Drop just-hidden ids from the highlighter selection. Without this the
   // hidden elements stay "selected" as ghosts — the properties panel keeps
@@ -2152,7 +2166,7 @@ export function useViewer(
     [],
   );
 
-  const isolate = useCallback(async (items: OBC.ModelIdMap) => {
+  const isolateRaw = useCallback(async (items: OBC.ModelIdMap) => {
     const hider = hiderRef.current;
     const fragments = fragmentsRef.current;
     // OBJ parts are plain meshes the Hider cannot see, so their visibility is
@@ -2174,7 +2188,12 @@ export function useViewer(
         obj.visible = targetKeys.has(mid);
       }
     }
-    await hider.isolate(items);
+    // NOT hider.isolate(items): that runs hide-all and show-subset through
+    // Promise.all, so on a large map the hide can settle after the show and
+    // leave part of the isolated selection invisible — a different part each
+    // run. The two passes are the same work, just ordered.
+    await hider.set(false);
+    await hider.set(true, items);
     // Selection outside the isolated set just went invisible — prune it
     // (models absent from items are fully hidden → drop; models present
     // keep only the intersection with the isolated ids).
@@ -2197,6 +2216,11 @@ export function useViewer(
     bumpRuntimeVisibility();
   }, [bumpRuntimeVisibility, pruneSelection]);
 
+  const isolate = useCallback(
+    (items: OBC.ModelIdMap) => visibilityQueue.run(() => isolateRaw(items)),
+    [isolateRaw, visibilityQueue],
+  );
+
   // Normalize ModelIdMap (Set or array) → Record<modelId, Set<number>> for
   // intersect-friendly storage.
   const normalizeIdMap = (items: OBC.ModelIdMap) => {
@@ -2218,7 +2242,7 @@ export function useViewer(
     [],
   );
 
-  const hide = useCallback(async (items: OBC.ModelIdMap) => {
+  const hideRaw = useCallback(async (items: OBC.ModelIdMap) => {
     setMeshPartsVisible(meshModelsRef.current, false, items as any);
     const hider = hiderRef.current;
     if (hider) await hider.set(false, items);
@@ -2231,6 +2255,11 @@ export function useViewer(
     await pruneSelection(pruneMap);
     bumpRuntimeVisibility();
   }, [bumpRuntimeVisibility, pruneSelection]);
+
+  const hide = useCallback(
+    (items: OBC.ModelIdMap) => visibilityQueue.run(() => hideRaw(items)),
+    [hideRaw, visibilityQueue],
+  );
 
   // Restore fragment-level visibility for ONE model without touching any
   // other model. Catalog cache enumerates the elements when available;
@@ -2265,7 +2294,7 @@ export function useViewer(
   // used for per-model operations like tree storey/category toggles. This
   // diffs against the model's current hider state and applies two scoped
   // set() calls instead.
-  const setModelExactVisibility = useCallback(
+  const setModelExactVisibilityRaw = useCallback(
     async (modelId: string, visibleIds: Set<number>) => {
       const hider = hiderRef.current;
       const fragments = fragmentsRef.current;
@@ -2292,10 +2321,16 @@ export function useViewer(
     },
     [bumpRuntimeVisibility, pruneSelection],
   );
+
+  const setModelExactVisibility = useCallback(
+    (modelId: string, visibleIds: Set<number>) =>
+      visibilityQueue.run(() => setModelExactVisibilityRaw(modelId, visibleIds)),
+    [setModelExactVisibilityRaw, visibilityQueue],
+  );
   // model without touching other intentionally-hidden models. Used by tree's
   // empty-hidden-set path so toggling the last hidden patro back on doesn't
   // also un-hide another model the user wanted gone.
-  const showModelAll = useCallback(async (modelId: string) => {
+  const showModelAllRaw = useCallback(async (modelId: string) => {
     const fragments = fragmentsRef.current;
     const model: any = fragments?.list.get(modelId);
     if (!model) return;
@@ -2307,7 +2342,12 @@ export function useViewer(
     bumpRuntimeVisibility();
   }, [bumpRuntimeVisibility, restoreModelElements]);
 
-  const showAll = useCallback(async () => {
+  const showModelAll = useCallback(
+    (modelId: string) => visibilityQueue.run(() => showModelAllRaw(modelId)),
+    [showModelAllRaw, visibilityQueue],
+  );
+
+  const showAllRaw = useCallback(async () => {
     setMeshPartsVisible(meshModelsRef.current, true);
     const hider = hiderRef.current;
     const fragments = fragmentsRef.current;
@@ -2332,6 +2372,11 @@ export function useViewer(
     setShowAllVersion((v) => v + 1);
     bumpRuntimeVisibility();
   }, [bumpRuntimeVisibility]);
+
+  const showAll = useCallback(
+    () => visibilityQueue.run(showAllRaw),
+    [showAllRaw, visibilityQueue],
+  );
 
   const setClipMode = useCallback((enabled: boolean) => {
     clipModeRef.current = enabled;
@@ -3051,7 +3096,7 @@ export function useViewer(
     [],
   );
 
-  const setModelHidden = useCallback(
+  const setModelHiddenRaw = useCallback(
     async (modelId: string, hidden: boolean) => {
       const meshModel = meshModelsRef.current.get(modelId);
       if (meshModel) {
@@ -3088,6 +3133,12 @@ export function useViewer(
       }
     },
     [bumpRuntimeVisibility, pruneSelection, restoreModelElements],
+  );
+
+  const setModelHidden = useCallback(
+    (modelId: string, hidden: boolean) =>
+      visibilityQueue.run(() => setModelHiddenRaw(modelId, hidden)),
+    [setModelHiddenRaw, visibilityQueue],
   );
 
   const getModelGroups = useCallback(async (
@@ -3655,7 +3706,7 @@ export function useViewer(
   // or "all" (untouched / fully visible). Unlike captureVisibleItems this
   // also records hidden models and explicitly distinguishes "all", so a
   // saved view can restore the exact scene in multi-model projects.
-  const captureVisibilitySnapshot = useCallback(async (): Promise<
+  const captureVisibilitySnapshotRaw = useCallback(async (): Promise<
     VisibilitySnapshotEntry[]
   > => {
     const fragments = fragmentsRef.current;
@@ -3682,11 +3733,19 @@ export function useViewer(
     return out;
   }, []);
 
+  // Queued like the writes: the undo snapshot has to describe a settled
+  // scene. Read while an op is mid-flight it records a half-applied state
+  // and Cmd+Z restores something the user never saw.
+  const captureVisibilitySnapshot = useCallback(
+    () => visibilityQueue.run(captureVisibilitySnapshotRaw),
+    [captureVisibilitySnapshotRaw, visibilityQueue],
+  );
+
   // Restore the scene to a saved visibility snapshot. Models absent from the
   // snapshot (added to the project later) are left fully visible. Partial
   // entries become the isolation root so subsequent tree toggles intersect
   // with the restored subset instead of resetting it.
-  const applyVisibilitySnapshot = useCallback(
+  const applyVisibilitySnapshotRaw = useCallback(
     async (snapshot: VisibilitySnapshotEntry[]) => {
       const fragments = fragmentsRef.current;
       const hider = hiderRef.current;
@@ -3720,7 +3779,7 @@ export function useViewer(
           // other model's elements and undo the entries restored before it.
           const ids = new Set<number>(entry.visibleIds);
           partialRoot[mid] = ids;
-          await setModelExactVisibility(mid, ids);
+          await setModelExactVisibilityRaw(mid, ids);
         }
       }
       isolationRootRef.current = Object.keys(partialRoot).length
@@ -3730,7 +3789,13 @@ export function useViewer(
       if (fragments.initialized) fragments.core.update(true);
       bumpRuntimeVisibility();
     },
-    [bumpRuntimeVisibility, restoreModelElements, setModelExactVisibility],
+    [bumpRuntimeVisibility, restoreModelElements, setModelExactVisibilityRaw],
+  );
+
+  const applyVisibilitySnapshot = useCallback(
+    (snapshot: VisibilitySnapshotEntry[]) =>
+      visibilityQueue.run(() => applyVisibilitySnapshotRaw(snapshot)),
+    [applyVisibilitySnapshotRaw, visibilityQueue],
   );
 
   captureVisibilitySnapshotRef.current = captureVisibilitySnapshot;
