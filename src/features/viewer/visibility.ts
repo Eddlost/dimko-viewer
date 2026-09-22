@@ -151,3 +151,23 @@ export function filterSelectionBySnapshot(
   }
   return out;
 }
+
+/**
+ * Clip a set of ids to the active isolation root.
+ *
+ * "Restore everything in this model" still has to mean "everything the active
+ * isolation allows". A restore that ignores the root silently cancels the
+ * isolation, and the user sees elements they deliberately isolated away come
+ * back — without having asked for it and without anything saying so.
+ *
+ * A null or empty root means nothing is isolated, so everything passes.
+ */
+export function clipToRoot(
+  ids: Iterable<number>,
+  root: Set<number> | null | undefined,
+): Set<number> {
+  if (!root || root.size === 0) return new Set(ids);
+  const out = new Set<number>();
+  for (const id of ids) if (root.has(id)) out.add(id);
+  return out;
+}

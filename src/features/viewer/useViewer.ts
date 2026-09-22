@@ -11,6 +11,7 @@ import {
 } from "../properties/propertyIndex";
 import {
   chooseSnapshotMode,
+  clipToRoot,
   filterSelectionBySnapshot,
   type VisibilitySnapshotEntry,
 } from "./visibility";
@@ -2345,16 +2346,27 @@ export function useViewer(
     const fragments = fragmentsRef.current;
     const model: any = fragments?.list.get(modelId);
     if (!hider || !model) return;
+    // "Restore this model" still means "as far as the active isolation
+    // allows". Without the clip, un-hiding a model or clearing its last
+    // hidden group cancels an isolation nobody asked to cancel, and the
+    // elements the user isolated away come back.
+    //
+    // This is also why the fault only showed up in the desktop app: the two
+    // branches below are not equivalent. The catalog branch enumerates every
+    // element of the model, and the catalog is only ever loaded there — on
+    // the web the fallback runs instead and re-shows a much smaller set.
+    const root = isolationRootRef.current?.[modelId] ?? null;
     const idx = propertyIndexCache.current.get(modelId);
     if (idx && idx.categoryByElement.size > 0) {
-      const allIds = new Set<number>(idx.categoryByElement.keys());
-      await hider.set(true, { [modelId]: allIds });
+      await hider.set(true, {
+        [modelId]: clipToRoot(idx.categoryByElement.keys(), root),
+      });
       return;
     }
     try {
       const hiddenIds = await model.getItemsByVisibility?.(false);
       if (Array.isArray(hiddenIds) && hiddenIds.length) {
-        await hider.set(true, { [modelId]: new Set<number>(hiddenIds) });
+        await hider.set(true, { [modelId]: clipToRoot(hiddenIds, root) });
       }
     } catch (e) {
       console.warn("[viewer] restoreModelElements failed", modelId, e);
@@ -3828,6 +3840,10 @@ export function useViewer(
       const hider = hiderRef.current;
       if (!fragments || !hider) return;
       const byModel = new Map(snapshot.map((s) => [s.modelId, s]));
+      // A snapshot describes the whole scene, so the isolation that is
+      // active right now must not clip the restore (restoreModelElements
+      // reads this ref). The new root is set from the snapshot at the end.
+      isolationRootRef.current = null;
       const partialRoot: Record<string, Set<number>> = {};
       for (const [key, model] of fragments.list as any) {
         const mid = (model as any)?.modelId ?? key;

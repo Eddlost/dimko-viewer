@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  clipToRoot,
   computeVisibleIds,
   chooseSnapshotMode,
   filterSelectionBySnapshot,
@@ -179,5 +180,27 @@ describe("filterSelectionBySnapshot", () => {
   });
   it("model not in snapshot → kept as-is", () => {
     expect(filterSelectionBySnapshot(sel, [])).toEqual(sel);
+  });
+});
+
+describe("clipToRoot", () => {
+  it("passes everything through when nothing is isolated", () => {
+    expect([...clipToRoot([1, 2, 3], null)]).toEqual([1, 2, 3]);
+    expect([...clipToRoot([1, 2, 3], new Set())]).toEqual([1, 2, 3]);
+  });
+
+  // The bug: restoring a model while an isolation was active un-hid the whole
+  // model, cancelling the isolation without asking.
+  it("keeps only what the isolation allows", () => {
+    expect([...clipToRoot([1, 2, 3, 4], new Set([2, 4, 9]))]).toEqual([2, 4]);
+  });
+
+  it("returns nothing when the restore and the isolation do not overlap", () => {
+    expect(clipToRoot([1, 2], new Set([7, 8])).size).toBe(0);
+  });
+
+  it("accepts any iterable, so a Map's keys can be clipped directly", () => {
+    const catalog = new Map([[10, "IFCWALL"], [11, "IFCSLAB"], [12, "IFCDOOR"]]);
+    expect([...clipToRoot(catalog.keys(), new Set([11, 12]))]).toEqual([11, 12]);
   });
 });
