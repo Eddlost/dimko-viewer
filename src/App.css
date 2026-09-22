@@ -1,21 +1,38 @@
 @import "tailwindcss";
 
-@theme {
-  --color-bg: #0a0d12;
-  --color-bg-elevated: #0f141b;
-  --color-panel: #141a22;
-  --color-panel-elevated: #1a2230;
-  --color-border: #232a36;
-  --color-border-strong: #2e3744;
-  --color-text: #e6edf3;
-  --color-text-dim: #8b95a3;
-  --color-text-mute: #5a6472;
-  --color-accent: #00d4ff;
-  --color-accent-dim: #0891b2;
-  --color-accent-soft: rgba(0, 212, 255, 0.12);
-  --color-danger: #f87171;
+/* Radix Colors, dark: Slate for surfaces and text, Cyan for the accent.
+   Radix numbers its scales by ROLE, and the mapping below keeps to it —
+   1-2 app background, 3-5 component background, 6-8 borders, 9-10 solid
+   fills, 11 low-contrast text, 12 high-contrast text. Picking a step for a
+   job it was not drawn for is how a palette starts needing one-off
+   overrides, so follow the roles when adding a token.
 
-  --shadow-glow: 0 0 0 1px rgba(0, 212, 255, 0.35), 0 0 24px -8px rgba(0, 212, 255, 0.4);
+   Accent sits on step 11, not 9: it is used as text 84x and as a solid
+   background 19x (always with `text-black` on top), and only the lighter
+   step serves both. Step 9 is the accent's border/solid variant. */
+@theme {
+  --color-bg: #111113;              /* slate 1 */
+  --color-bg-elevated: #18191b;     /* slate 2 */
+  --color-panel: #212225;           /* slate 3 */
+  --color-panel-elevated: #272a2d;  /* slate 4 */
+  --color-border: #363a3f;          /* slate 6  — subtle separator */
+  --color-border-strong: #43484e;   /* slate 7  — interactive border */
+  --color-text: #edeef0;            /* slate 12 */
+  --color-text-dim: #b0b4ba;        /* slate 11 */
+  /* Interpolated between slate 10 and 11, not a Radix step — deliberate.
+     Radix gives ONE low-contrast text step (11) and DIMKO's UI wants two
+     levels below the primary. Step 10 is drawn as a solid hover fill, and
+     used as text it measures 3.75:1 on --color-panel, under the 4.5:1 AA
+     floor — and this is the most-used token in the app (191 uses, nearly all
+     text-xs). This value clears AA on bg, panel and panel-elevated
+     (5.97 / 5.03 / 4.56). If the surface steps move, re-check it. */
+  --color-text-mute: #8d9199;
+  --color-accent: #4ccce6;          /* cyan 11 */
+  --color-accent-dim: #00a2c7;      /* cyan 9  — border / solid */
+  --color-accent-soft: rgba(0, 162, 199, 0.16);
+  --color-danger: #ff9592;          /* red 11 */
+
+  --shadow-glow: 0 0 0 1px rgba(76, 204, 230, 0.32), 0 0 24px -8px rgba(76, 204, 230, 0.38);
 }
 
 :root {
