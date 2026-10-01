@@ -27,11 +27,12 @@ export const IFC_STOREY_SOURCE: StoreySource = { kind: "ifc" };
 /**
  * Bucket for elements the chosen property says nothing about.
  *
- * Not cosmetic: `computeVisibleIds` treats the union of storeys as the base
- * set every other axis subtracts from, so an element outside every storey
- * disappears the moment the user hides anything at all. The IFC axis is
- * near-total by construction; a property axis never is — half a model may
- * simply not carry the estimator's property. Embedders localise the label.
+ * A property axis is never total — half a model may simply not carry the
+ * estimator's property — and without this row the user has no way to hide or
+ * isolate the part it says nothing about. (It used to be load-bearing too:
+ * `computeVisibleIds` once took the union of storeys as the base set, so an
+ * element outside every storey vanished the moment anything was hidden.)
+ * Embedders localise the label.
  */
 export const UNASSIGNED_STOREY_NAME = "Unassigned";
 
@@ -136,6 +137,57 @@ export function listStoreySourceProperties(
     });
   }
   out.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return out;
+}
+
+/** One node of `FragmentsModel.getSpatialStructure()`. */
+export type SpatialTreeNode = {
+  category: string | null;
+  localId: number | null;
+  children?: SpatialTreeNode[];
+};
+
+const STOREY_CATEGORY = "IFCBUILDINGSTOREY";
+
+/**
+ * Every storey in the spatial tree with everything underneath it — elements
+ * contained in the storey directly, and also those one step removed: furniture
+ * contained in a space, the members and plates of a curtain wall, the flights
+ * of a stair. The classifier only knows the direct ones, and on a real model
+ * the rest is close to half of it.
+ *
+ * Fragments does not put the category on the item. It inserts a grouping
+ * node — `{ category: "IFCBUILDINGSTOREY", localId: null }` — whose children
+ * are the storeys themselves, `{ category: null, localId: 111 }`. An earlier
+ * version looked for a node carrying both at once, never found one, and every
+ * storey silently fell back to direct containment. That node shape is still
+ * accepted here, it just is not what fragments produces.
+ */
+export function collectInclusiveStoreys(
+  root: SpatialTreeNode,
+): Array<{ localId: number; ids: Set<number> }> {
+  const out: Array<{ localId: number; ids: Set<number> }> = [];
+  const walk = (
+    node: SpatialTreeNode,
+    groupCategory: string | null,
+    current: { ids: Set<number> } | null,
+  ) => {
+    let bucket = current;
+    if (node.localId !== null && node.localId !== undefined) {
+      const category = node.category ?? groupCategory;
+      if (category === STOREY_CATEGORY) {
+        const storey = { localId: node.localId, ids: new Set([node.localId]) };
+        out.push(storey);
+        bucket = storey;
+      } else if (bucket) {
+        bucket.ids.add(node.localId);
+      }
+    }
+    // A grouping node names the category of the items directly below it.
+    const childGroup = node.localId === null ? node.category : null;
+    for (const child of node.children ?? []) walk(child, childGroup, bucket);
+  };
+  walk(root, null, null);
   return out;
 }
 

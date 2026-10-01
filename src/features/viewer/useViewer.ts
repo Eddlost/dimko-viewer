@@ -26,8 +26,10 @@ import { previewForClick } from "./snapPlacement";
 import { fitPlane, planeBasis, polygonArea, projectToFitPlane } from "./area";
 import {
   IFC_STOREY_SOURCE,
+  collectInclusiveStoreys,
   listStoreySourceProperties as listPropertiesFromCatalog,
   storeysFromCatalog,
+  type SpatialTreeNode,
   type StoreySource,
   type StoreySourceProperty,
 } from "./storeySource";
@@ -109,11 +111,25 @@ export type SnapResult = {
 // literal: POINT = 0, LINE = 1, FACE = 2.
 const SNAP_CLASS_POINT = 0;
 
-type SpatialTreeNode = {
-  category: string | null;
-  localId: number | null;
-  children?: SpatialTreeNode[];
-};
+/**
+ * A model's drawable elements, split by what is on screen right now.
+ *
+ * Deliberately not `getItemsByVisibility`. Measured on a real model
+ * (2026-09-29): `(true)` returns every item the model has — 46 163, whatever
+ * is visible, half of them without geometry — so any split built on it treats
+ * the whole model as visible. `(false)` is accurate, but it is only half of a
+ * pair. `getVisible` over the drawable ids is the read that matches the screen.
+ */
+async function readModelVisibility(
+  model: any,
+): Promise<{ visible: number[]; hidden: number[] }> {
+  const all: number[] = (await model.getItemsIdsWithGeometry?.()) ?? [];
+  const flags: boolean[] = all.length ? await model.getVisible(all) : [];
+  const visible: number[] = [];
+  const hidden: number[] = [];
+  for (let i = 0; i < all.length; i++) (flags[i] ? visible : hidden).push(all[i]);
+  return { visible, hidden };
+}
 
 async function buildInclusiveStoreys(
   model: any,
@@ -129,22 +145,7 @@ async function buildInclusiveStoreys(
   }
   if (!root) return result;
 
-  const storeyNodes: { localId: number; ids: Set<number> }[] = [];
-  const collect = (node: SpatialTreeNode, current?: { ids: Set<number> }) => {
-    if (node.category === "IFCBUILDINGSTOREY" && node.localId !== null) {
-      const bucket = { localId: node.localId, ids: new Set<number>() };
-      bucket.ids.add(node.localId);
-      storeyNodes.push(bucket);
-      current = bucket;
-    } else if (current && node.localId !== null) {
-      current.ids.add(node.localId);
-    }
-    if (node.children) {
-      for (const child of node.children) collect(child, current);
-    }
-  };
-  collect(root);
-
+  const storeyNodes = collectInclusiveStoreys(root);
   if (!storeyNodes.length) return result;
 
   try {
@@ -157,7 +158,12 @@ async function buildInclusiveStoreys(
         datas?.[i]?.Name?.value ??
         datas?.[i]?.LongName?.value ??
         `Storey ${storeyNodes[i].localId}`;
-      result.set(String(name), storeyNodes[i].ids);
+      // Two storeys can share a name; the classifier groups them by name too,
+      // so merge rather than let the second one drop the first one's elements.
+      const key = String(name);
+      const prev = result.get(key);
+      if (prev) for (const id of storeyNodes[i].ids) prev.add(id);
+      else result.set(key, storeyNodes[i].ids);
     }
   } catch (e) {
     console.warn("[viewer] storey name lookup failed", e);
@@ -191,6 +197,13 @@ export type UndoEntry =
   | {
       kind: "visibility";
       snapshot: VisibilitySnapshotEntry[];
+      /**
+       * The isolation in force when the step was recorded. The snapshot can
+       * only guess it from what was visible, and an isolation with nothing
+       * left on screen — its one item unchecked — reads as no isolation at
+       * all, so undo brought back everything the isolation had excluded.
+       */
+      root: Record<string, Set<number>> | null;
       /** Embedder state to put back with the scene — see recordVisibilityUndo. */
       restore?: () => void | Promise<void>;
       label?: string;
@@ -1807,6 +1820,9 @@ export function useViewer(
           measureGroup,
           components,
           clipper,
+          // The pick every click goes through — lets a test tell "the click
+          // missed" apart from "the handler dropped the hit".
+          pickFirstVisible,
         };
       }
 
@@ -2351,23 +2367,15 @@ export function useViewer(
     // hidden group cancels an isolation nobody asked to cancel, and the
     // elements the user isolated away come back.
     //
-    // This is also why the fault only showed up in the desktop app: the two
-    // branches below are not equivalent. The catalog branch enumerates every
-    // element of the model, and the catalog is only ever loaded there — on
-    // the web the fallback runs instead and re-shows a much smaller set.
+    // One path for every build. There used to be a second one that enumerated
+    // the property catalog, and the catalog is only ever loaded in the desktop
+    // app — so the app and the browser restored different sets, and a fault
+    // in one could not be reproduced in the other.
     const root = isolationRootRef.current?.[modelId] ?? null;
-    const idx = propertyIndexCache.current.get(modelId);
-    if (idx && idx.categoryByElement.size > 0) {
-      await hider.set(true, {
-        [modelId]: clipToRoot(idx.categoryByElement.keys(), root),
-      });
-      return;
-    }
     try {
-      const hiddenIds = await model.getItemsByVisibility?.(false);
-      if (Array.isArray(hiddenIds) && hiddenIds.length) {
-        await hider.set(true, { [modelId]: clipToRoot(hiddenIds, root) });
-      }
+      const { hidden } = await readModelVisibility(model);
+      const toShow = clipToRoot(hidden, root);
+      if (toShow.size) await hider.set(true, { [modelId]: toShow });
     } catch (e) {
       console.warn("[viewer] restoreModelElements failed", modelId, e);
     }
@@ -2386,10 +2394,8 @@ export function useViewer(
       const model: any = fragments?.list.get(modelId);
       if (!hider || !model) return;
       try {
-        const curVisible: number[] =
-          (await model.getItemsByVisibility?.(true)) ?? [];
-        const curHidden: number[] =
-          (await model.getItemsByVisibility?.(false)) ?? [];
+        const { visible: curVisible, hidden: curHidden } =
+          await readModelVisibility(model);
         const toHide = curVisible.filter((id) => !visibleIds.has(id));
         const toShow = curHidden.filter((id) => visibleIds.has(id));
         if (toHide.length) await hider.set(false, { [modelId]: new Set(toHide) });
@@ -3041,6 +3047,11 @@ export function useViewer(
 
     if (entry.kind === "visibility") {
       await applyVisibilitySnapshotRef.current?.(entry.snapshot);
+      // The snapshot re-derived an isolation from what it saw; the recorded
+      // one is the truth (see UndoEntry). Bumping the version lets the
+      // embedder re-intersect its own hidden groups against it.
+      isolationRootRef.current = entry.root;
+      setIsolationRootVersion((v) => v + 1);
       // The embedder's half — hidden-group keys in a manifest, panel state —
       // goes back after the scene, so anything it reads from the viewer sees
       // the restored state.
@@ -3071,9 +3082,15 @@ export function useViewer(
       try {
         const snapshot = await captureVisibilitySnapshotRef.current?.();
         if (!snapshot) return;
+        const root = isolationRootRef.current;
         pushUndo({
           kind: "visibility",
           snapshot,
+          root: root
+            ? Object.fromEntries(
+                Object.entries(root).map(([mid, ids]) => [mid, new Set(ids)]),
+              )
+            : null,
           restore: opts?.restore,
           label: opts?.label,
         });
@@ -3620,8 +3637,9 @@ export function useViewer(
       const obj = (model as any)?.object;
       if (obj && obj.visible === false) continue;
       try {
-        const vis = await (model as any).getItemsByVisibility?.(true);
-        const ids = Array.isArray(vis) ? vis : [];
+        // Frame what is on screen, not the whole model — after an isolation
+        // the user wants the isolated part in view, not the building around it.
+        const { visible: ids } = await readModelVisibility(model);
         if (!ids.length) continue;
         const box: THREE.Box3 = await (model as any).getMergedBox(ids);
         if (!box.isEmpty()) {
@@ -3765,19 +3783,12 @@ export function useViewer(
       const obj = (model as any).object;
       if (obj?.visible === false) continue; // whole-model hidden
       try {
-        const visible: number[] = await (model as any).getItemsByVisibility?.(true);
-        const hidden: number[] = await (model as any).getItemsByVisibility?.(false);
-        // If the hider has never touched this model, both sets may be empty.
-        // In that case nothing is "filtered" — the full model is visible and
-        // we don't need to enumerate it (would be huge and the view restore
-        // path treats an empty selection as "show all").
-        if (
-          (!visible || !visible.length) &&
-          (!hidden || !hidden.length)
-        ) {
-          continue;
-        }
-        if (visible && visible.length) {
+        const { visible, hidden } = await readModelVisibility(model);
+        // Nothing hidden means nothing is "filtered" — the full model is
+        // visible and we don't need to enumerate it (would be huge and the
+        // view restore path treats an empty selection as "show all").
+        if (!hidden.length) continue;
+        if (visible.length) {
           out.push({
             modelId: (model as any).modelId,
             localIds: visible,
@@ -3809,11 +3820,8 @@ export function useViewer(
         continue;
       }
       try {
-        const visible: number[] =
-          (await (model as any).getItemsByVisibility?.(true)) ?? [];
-        const hiddenIds: number[] =
-          (await (model as any).getItemsByVisibility?.(false)) ?? [];
-        out.push(chooseSnapshotMode(mid, visible, hiddenIds, false));
+        const { visible, hidden } = await readModelVisibility(model);
+        out.push(chooseSnapshotMode(mid, visible, hidden, false));
       } catch (e) {
         console.warn("[viewer] captureVisibilitySnapshot failed", mid, e);
         out.push({ modelId: mid, mode: "all", visibleIds: [] });

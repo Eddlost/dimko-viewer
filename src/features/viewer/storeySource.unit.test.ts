@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { PropertyCatalog, ValueEntry } from "../properties/propertyIndex";
 import {
   UNASSIGNED_STOREY_NAME,
+  collectInclusiveStoreys,
   compareStoreyNames,
   listStoreySourceProperties,
   storeyRank,
   storeysFromCatalog,
+  type SpatialTreeNode,
 } from "./storeySource";
 
 function catalog(
@@ -165,5 +167,80 @@ describe("storeysFromCatalog", () => {
   it("returns null when every value is empty", () => {
     const c = catalog({ podlazi: { "1.NP": [], "2.NP": [] } }, 4);
     expect(storeysFromCatalog(c, "podlazi")).toBeNull();
+  });
+});
+
+describe("collectInclusiveStoreys", () => {
+  const item = (localId: number, ...children: SpatialTreeNode[]) => ({
+    category: null,
+    localId,
+    children,
+  });
+  const group = (category: string, ...children: SpatialTreeNode[]) => ({
+    category,
+    localId: null,
+    children,
+  });
+
+  // The shape fragments actually returns for a real model (OLOW, 2026-09-29):
+  // a category node with no id, and the items below it with no category.
+  const building = group(
+    "IFCPROJECT",
+    item(
+      108,
+      group(
+        "IFCBUILDING",
+        item(
+          111,
+          group(
+            "IFCBUILDINGSTOREY",
+            item(
+              1,
+              group("IFCWALL", item(10), item(11)),
+              group("IFCSPACE", item(20, group("IFCFURNITURE", item(21)))),
+              group(
+                "IFCCURTAINWALL",
+                item(30, group("IFCPLATE", item(31)), group("IFCMEMBER", item(32))),
+              ),
+            ),
+            item(2, group("IFCSLAB", item(40))),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it("finds the storeys fragments puts under a category node", () => {
+    const storeys = collectInclusiveStoreys(building);
+    expect(storeys.map((s) => s.localId)).toEqual([1, 2]);
+  });
+
+  it("takes in what is nested below a space or a curtain wall", () => {
+    const [first, second] = collectInclusiveStoreys(building);
+    expect([...first.ids].sort((a, b) => a - b)).toEqual([
+      1, 10, 11, 20, 21, 30, 31, 32,
+    ]);
+    expect([...second.ids].sort((a, b) => a - b)).toEqual([2, 40]);
+  });
+
+  it("still reads a node that carries its category and id together", () => {
+    const storeys = collectInclusiveStoreys({
+      category: "IFCBUILDING",
+      localId: 5,
+      children: [
+        {
+          category: "IFCBUILDINGSTOREY",
+          localId: 6,
+          children: [{ category: "IFCWALL", localId: 7 }],
+        },
+      ],
+    });
+    expect(storeys).toEqual([{ localId: 6, ids: new Set([6, 7]) }]);
+  });
+
+  it("returns nothing for a model without storeys", () => {
+    expect(
+      collectInclusiveStoreys(group("IFCPROJECT", item(1, group("IFCWALL", item(2))))),
+    ).toEqual([]);
   });
 });

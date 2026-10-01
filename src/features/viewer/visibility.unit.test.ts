@@ -127,6 +127,43 @@ describe("computeVisibleIds", () => {
     const r = computeVisibleIds(M, g, new Set(["bud:02 | penetrace"]), null);
     expect([...r.visibleIds].sort()).toEqual([1, 4, 5, 6]);
   });
+
+  // Element 7 is in no storey — furniture contained in a space, a
+  // curtain-wall panel, anything a property axis does not mention.
+  function withUnclaimed(): Groups {
+    const g = groups();
+    g.categories.push({ name: "IFCFURNITURE", items: { [M]: new Set([7]) } });
+    return g;
+  }
+
+  it("an element no storey claims survives hiding an unrelated group", () => {
+    const r = computeVisibleIds(M, withUnclaimed(), new Set(["cat:IFCSPACE"]), null);
+    expect([...r.visibleIds].sort()).toEqual([1, 2, 4, 5, 7]);
+  });
+
+  it("an isolation keeps its unclaimed elements while a group is hidden", () => {
+    // The KV3.1 case: 78 isolated, 46 of them furniture in spaces, IFCSPACE
+    // hidden in the manifest — the tree used to show 32.
+    const r = computeVisibleIds(
+      M,
+      withUnclaimed(),
+      new Set(["cat:IFCSPACE"]),
+      new Set([1, 7]),
+    );
+    expect([...r.visibleIds].sort()).toEqual([1, 7]);
+  });
+
+  it("hiding a storey hides only that storey", () => {
+    const r = computeVisibleIds(M, withUnclaimed(), new Set(["stor:2NP"]), null);
+    expect([...r.visibleIds].sort()).toEqual([1, 2, 3, 7]);
+  });
+
+  it("an element in a hidden and a visible storey stays visible", () => {
+    const g = groups();
+    g.storeys[1].items[M].add(1);
+    const r = computeVisibleIds(M, g, new Set(["stor:2NP"]), null);
+    expect([...r.visibleIds].sort()).toEqual([1, 2, 3]);
+  });
 });
 
 describe("chooseSnapshotMode", () => {

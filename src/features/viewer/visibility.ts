@@ -74,14 +74,27 @@ export function computeVisibleIds(
     return { restricted: true, visibleIds: new Set(root!) };
   }
 
+  // Start from everything and take away only what is hidden. Hiding a group
+  // must hide that group's elements and nothing else. The base used to be the
+  // union of storeys, so whatever no storey claimed — furniture in a space,
+  // curtain-wall panels, half of a model under a property axis — vanished the
+  // moment anything at all was hidden, isolations included.
   const visibleIds = new Set<number>();
-  if (groups.storeys.length > 0) {
+  for (const c of groups.categories) addIds(visibleIds, c.items[modelId]);
+  for (const s of groups.storeys) addIds(visibleIds, s.items[modelId]);
+  if (hiddenStoreyNames.size > 0) {
+    // An element can sit in two storeys (a property axis says so, or a merged
+    // name); a storey left on keeps it.
+    const kept = new Set<number>();
     for (const s of groups.storeys) {
-      if (hiddenStoreyNames.has(s.name)) continue;
-      addIds(visibleIds, s.items[modelId]);
+      if (!hiddenStoreyNames.has(s.name)) addIds(kept, s.items[modelId]);
     }
-  } else {
-    for (const c of groups.categories) addIds(visibleIds, c.items[modelId]);
+    for (const s of groups.storeys) {
+      if (!hiddenStoreyNames.has(s.name)) continue;
+      const ids = s.items[modelId];
+      if (!ids) continue;
+      for (const id of ids) if (!kept.has(id)) visibleIds.delete(id);
+    }
   }
   for (const c of groups.categories) {
     if (!hiddenCatNames.has(c.name)) continue;
