@@ -23,6 +23,7 @@ export {
   type UndoneAction,
   type LoadedModel,
   type SelectionTarget,
+  type VisibilityUndoStep,
   type SnapResult,
   type SavedViewClip,
   type VisibilityMap,

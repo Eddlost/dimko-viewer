@@ -173,6 +173,20 @@ async function buildInclusiveStoreys(
 
 export type SelectionTarget = { modelId: string; localId: number } | null;
 
+/**
+ * One recorded Cmd+Z step, handed back so the caller can withdraw it when the
+ * change it was recorded for fails. Left on the stack, a step for a change
+ * that never happened makes the next Cmd+Z do nothing visible.
+ */
+export type VisibilityUndoStep = {
+  /**
+   * Put the scene back to the recorded state and drop the step. If later
+   * steps were recorded on top of it meanwhile, only drop it — rolling back
+   * underneath them would undo their changes too.
+   */
+  rollback: () => Promise<void>;
+};
+
 export type VisibilityMap = Record<string, number[]>;
 
 export type { VisibilitySnapshotEntry } from "./visibility";
@@ -3078,12 +3092,15 @@ export function useViewer(
    * knows where an action begins; the viewer does not.
    */
   const recordVisibilityUndo = useCallback(
-    async (opts?: { label?: string; restore?: () => void | Promise<void> }) => {
+    async (opts?: {
+      label?: string;
+      restore?: () => void | Promise<void>;
+    }): Promise<VisibilityUndoStep | null> => {
       try {
         const snapshot = await captureVisibilitySnapshotRef.current?.();
-        if (!snapshot) return;
+        if (!snapshot) return null;
         const root = isolationRootRef.current;
-        pushUndo({
+        const entry: UndoEntry = {
           kind: "visibility",
           snapshot,
           root: root
@@ -3093,12 +3110,22 @@ export function useViewer(
             : null,
           restore: opts?.restore,
           label: opts?.label,
-        });
+        };
+        pushUndo(entry);
+        return {
+          rollback: async () => {
+            const stack = undoStackRef.current;
+            if (!stack.includes(entry)) return;
+            if (stack[stack.length - 1] === entry) await undo();
+            else dropUndoEntries((e) => e === entry);
+          },
+        };
       } catch (e) {
         console.error("[viewer] recordVisibilityUndo failed", e);
+        return null;
       }
     },
-    [pushUndo],
+    [dropUndoEntries, pushUndo, undo],
   );
 
   const clipFromHit = useCallback(
