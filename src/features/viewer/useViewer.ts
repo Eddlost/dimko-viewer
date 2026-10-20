@@ -24,6 +24,7 @@ import { insideClipPlanes, sectionCutPoints } from "./clipping";
 import { createSerialQueue } from "./opQueue";
 import { previewForClick } from "./snapPlacement";
 import { fitPlane, planeBasis, polygonArea, projectToFitPlane } from "./area";
+import { buildGroupTree, type GroupNode, type RawIfcGroup } from "./ifcGroups";
 import {
   IFC_STOREY_SOURCE,
   collectInclusiveStoreys,
@@ -3432,6 +3433,58 @@ export function useViewer(
     return fragmentsRef.current?.list.get(modelId) ?? null;
   }, []);
 
+  /**
+   * The model's IfcGroup hierarchy (budget, systems, zones), empty when it
+   * has none. Members come from `getRelations` — the relation config of
+   * `getItemsData` returns them empty, and asking it for attributes of a
+   * 24k-member group takes minutes. Models fragmented before the importer
+   * kept groups have none until re-imported from the IFC.
+   */
+  const getGroupTree = useCallback(
+    async (modelId: string): Promise<GroupNode[]> => {
+      const model: any = fragmentsRef.current?.list.get(modelId);
+      if (!model) return [];
+      const byCat: Record<string, number[]> = await model.getItemsOfCategories(
+        [/^IFCGROUP$/],
+      );
+      const ids = byCat["IFCGROUP"] ?? [];
+      if (!ids.length) return [];
+      const names = new Map<number, string>();
+      // Estimator models carry ~2000 groups; one request for all of them
+      // stalls the worker.
+      for (let i = 0; i < ids.length; i += 200) {
+        const chunk = ids.slice(i, i + 200);
+        const data: any[] = await model.getItemsData(chunk, {
+          attributesDefault: false,
+          attributes: ["Name"],
+          relationsDefault: { attributes: false, relations: false },
+        });
+        data.forEach((d, k) => {
+          const name = d?.Name?.value;
+          names.set(chunk[k], name == null ? `#${chunk[k]}` : String(name));
+        });
+      }
+      const relations: Map<number, any> = await model.getRelations(ids);
+      const raw: RawIfcGroup[] = ids
+        .slice()
+        .sort((a, b) => a - b)
+        .map((localId) => {
+          const entry = relations.get(localId);
+          // Single-threaded API wraps the payload in {data}, the worker does not.
+          const members = entry?.data?.IsGroupedBy ?? entry?.IsGroupedBy;
+          return {
+            localId,
+            name: names.get(localId) ?? `#${localId}`,
+            memberIds: Array.isArray(members)
+              ? members.filter((v: unknown): v is number => typeof v === "number")
+              : [],
+          };
+        });
+      return buildGroupTree(raw);
+    },
+    [],
+  );
+
   // Mesh-volume: sum the actual triangulated mesh volume of every selected
   // element by delegating to fragments' worker-side `getItemsVolume`. This
   // is the exact volume of the elements themselves (not the gap between
@@ -4066,6 +4119,7 @@ export function useViewer(
     listStoreySourceProperties,
     getItemData,
     getRawModel,
+    getGroupTree,
     getPropertyIndex,
     peekPropertyIndex,
     setPropertyIndex,

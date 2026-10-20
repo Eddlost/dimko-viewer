@@ -40,6 +40,12 @@ export {
 export { OrientationGizmo } from "./features/viewer/OrientationGizmo";
 
 export {
+  buildGroupTree,
+  type GroupNode,
+  type RawIfcGroup,
+} from "./features/viewer/ifcGroups";
+
+export {
   fitPlane,
   planeBasis,
   polygonArea,
