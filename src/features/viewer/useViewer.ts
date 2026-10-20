@@ -3762,6 +3762,16 @@ export function useViewer(
     } catch (e) {
       console.warn("[viewer] recenter fitToBox failed", e);
     }
+    // Fragments brings new geometry on screen across several update rounds,
+    // and the rounds normally ride on camera "update"/"rest" events. A model
+    // that lands where the previous one stood leaves the camera where it is,
+    // no event fires, and the model stays invisible until the user nudges
+    // the view — one update right here is too early to settle it.
+    for (const delay of [0, 150, 500, 1200]) {
+      setTimeout(() => {
+        if (fragments.initialized) fragments.core.update(true);
+      }, delay);
+    }
   }, []);
 
   /** Vertical field of view in degrees; ignored in orthographic mode. */
