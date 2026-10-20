@@ -83,3 +83,36 @@ export function parseModelLinks(search: string, baseUrl: string): LinkedModel[] 
   }
   return out;
 }
+
+/**
+ * `?isolate=` names what the link is about inside the model — a skladba
+ * ("F.01") or a product ("KV1.1") from the model's group tree. May repeat;
+ * the scene shows the union.
+ */
+const ISOLATE_PARAM = "isolate";
+
+export function parseIsolateQueries(search: string): string[] {
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(search);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const raw of params.getAll(ISOLATE_PARAM)) {
+    const value = raw.trim();
+    if (value && !out.includes(value)) out.push(value);
+  }
+  return out;
+}
+
+/**
+ * The current link with `isolate=` set to `query` (replacing any earlier
+ * one) and everything else — `model=` first of all — kept as it is.
+ */
+export function linkWithIsolate(href: string, query: string): string {
+  const url = new URL(href);
+  url.searchParams.delete(ISOLATE_PARAM);
+  if (query.trim()) url.searchParams.append(ISOLATE_PARAM, query.trim());
+  return url.toString();
+}

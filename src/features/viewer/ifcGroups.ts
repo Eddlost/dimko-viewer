@@ -62,3 +62,44 @@ export function buildGroupTree(groups: RawIfcGroup[]): GroupNode[] {
     .map((g) => build(g, new Set()))
     .filter((n) => n.elementIds.length > 0);
 }
+
+// Estimators name groups "205 | KV1.1; Klempířský výrobek…" or
+// "(001-005) | F.01 | Provětrávaná fasáda…": codes sit between `|` and `;`.
+const TOKEN_SPLIT = /[|;]/;
+
+const normalize = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase();
+
+/**
+ * Groups a search names, topmost first — a match's subgroups are not listed
+ * again, its elements already cover them. A query equal to a whole code
+ * ("F.01", "KV1.1") matches only that code, never "F.01a" or "KV1.10"; only
+ * when no group has the code does it fall back to any name containing the
+ * text.
+ */
+export function findGroups(tree: GroupNode[], query: string): GroupNode[] {
+  const q = normalize(query);
+  if (!q) return [];
+  const collect = (test: (n: GroupNode) => boolean) => {
+    const out: GroupNode[] = [];
+    const seen = new Set<number>();
+    const walk = (n: GroupNode) => {
+      if (test(n)) {
+        if (!seen.has(n.localId)) out.push(n);
+        seen.add(n.localId);
+        return;
+      }
+      n.children.forEach(walk);
+    };
+    tree.forEach(walk);
+    return out;
+  };
+  const exact = collect((n) => n.name.split(TOKEN_SPLIT).some((t) => normalize(t) === q));
+  return exact.length ? exact : collect((n) => normalize(n.name).includes(q));
+}
+
+/** Every element under any of the groups, once. */
+export function elementsOf(nodes: GroupNode[]): number[] {
+  const ids = new Set<number>();
+  for (const n of nodes) for (const id of n.elementIds) ids.add(id);
+  return [...ids];
+}

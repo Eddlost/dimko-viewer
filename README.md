@@ -32,7 +32,8 @@ The result is exact: measure a 2 m box edge and you get `2.000 m`, not
 - Orbit / pan / zoom, orientation gizmo, fit-to-model
 - Perspective or orthographic camera, with an adjustable field of view
 - Orbits around whatever you selected, not the scene centre
-- Structure tree — storeys and categories for IFC, parts for OBJ
+- Structure tree — IfcGroup tree (an estimator's budget), storeys and
+  categories for IFC, parts for OBJ; find a group by its code (`F.01`, `KV1.1`)
 - Per-model and per-group visibility, isolate, hide, zoom-to
 - Element properties including IFC property sets
 - **Distance** and **polyline** measurement with vertex/edge snapping
@@ -69,6 +70,22 @@ and deploying is enough; absolute URLs work too if the host sends permissive
 CORS headers. Several `model=` entries load in the order given. Linked models
 are fetched from the link every time and are not written to browser storage, so
 reopening the link never duplicates them.
+
+### Opening on one product
+
+Add `isolate=` and the linked model opens showing only the groups with that
+code — a skladba, a budget item, a product:
+
+```
+https://you.github.io/dimko-viewer/?model=models/building.frag&isolate=KV1.1
+```
+
+The code is matched whole against the parts of a group name split by `|` and
+`;`, so `F.01` finds `(001-005) | F.01 | Provětrávaná fasáda` but not `F.01a`;
+only when no group carries the code does any name containing the text count.
+`isolate=` may repeat. Type a code into the search box above the group tree to
+see what it finds; **link** copies the current link with that `isolate=`. For a
+large model link the `.frag` (a fraction of the IFC's size) rather than the IFC.
 
 ## Where your files go
 

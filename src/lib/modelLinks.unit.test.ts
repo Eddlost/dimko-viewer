@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseModelLinks } from "./modelLinks";
+import {
+  linkWithIsolate,
+  parseIsolateQueries,
+  parseModelLinks,
+} from "./modelLinks";
 
 const BASE = "https://acme.github.io/dimko-viewer/";
 
@@ -56,5 +60,22 @@ describe("parseModelLinks", () => {
   it("returns nothing when no model is named", () => {
     expect(parseModelLinks("", BASE)).toEqual([]);
     expect(parseModelLinks("?share=abc", BASE)).toEqual([]);
+  });
+});
+
+describe("isolate links", () => {
+  it("reads every isolate= once, trimmed", () => {
+    expect(
+      parseIsolateQueries("?model=a.frag&isolate=F.01&isolate=%20KV1.1%20&isolate=F.01&isolate="),
+    ).toEqual(["F.01", "KV1.1"]);
+    expect(parseIsolateQueries("?model=a.frag")).toEqual([]);
+  });
+
+  it("sets isolate= and keeps the models", () => {
+    const href = "https://x.github.io/dimko-viewer/?model=models/a.frag&isolate=old";
+    const link = linkWithIsolate(href, "KV1.1");
+    expect(new URL(link).searchParams.getAll("model")).toEqual(["models/a.frag"]);
+    expect(parseIsolateQueries(new URL(link).search)).toEqual(["KV1.1"]);
+    expect(parseIsolateQueries(new URL(linkWithIsolate(href, " ")).search)).toEqual([]);
   });
 });

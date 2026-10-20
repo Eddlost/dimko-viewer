@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useViewerContext } from "../viewer/ViewerContext";
 import { loadModels } from "../../lib/modelStore";
-import { parseModelLinks, type LinkedModel } from "../../lib/modelLinks";
+import {
+  parseIsolateQueries,
+  parseModelLinks,
+  type LinkedModel,
+} from "../../lib/modelLinks";
+import { elementsOf, findGroups } from "../viewer/ifcGroups";
 
 /**
  * Put the scene back the way the user left it, and load anything the link
@@ -11,8 +16,15 @@ import { parseModelLinks, type LinkedModel } from "../../lib/modelLinks";
  * would load every model twice.
  */
 export function RestoreModels() {
-  const { ready, loadFragBytes, loadObjBytes, loadIfcBytes, recenter } =
-    useViewerContext();
+  const {
+    ready,
+    loadFragBytes,
+    loadObjBytes,
+    loadIfcBytes,
+    recenter,
+    getGroupTree,
+    isolate,
+  } = useViewerContext();
   const restored = useRef(false);
   const [linkError, setLinkError] = useState<string | null>(null);
 
@@ -84,13 +96,47 @@ export function RestoreModels() {
         );
       }
 
+      // `?isolate=F.01` — the link is about one skladba or product, so the
+      // linked models open showing just that. Before recenter, which frames
+      // what is visible.
+      const queries = parseIsolateQueries(window.location.search);
+      if (!cancelled && queries.length && linked.length) {
+        const items: Record<string, Set<number>> = {};
+        const missing = new Set(queries);
+        for (const model of linked) {
+          const tree = await getGroupTree(model.id).catch(() => []);
+          for (const q of queries) {
+            const ids = elementsOf(findGroups(tree, q));
+            if (!ids.length) continue;
+            missing.delete(q);
+            const set = (items[model.id] ??= new Set());
+            for (const id of ids) set.add(id);
+          }
+        }
+        if (cancelled) return;
+        if (Object.keys(items).length) await isolate(items);
+        if (missing.size) {
+          setLinkError(
+            `V modelu není skupina ${[...missing].map((q) => `„${q}“`).join(", ")}.`,
+          );
+        }
+      }
+
       if (!cancelled && (linked.length || stored.length)) await recenter();
     })().catch((e) => console.error("[restore] failed", e));
 
     return () => {
       cancelled = true;
     };
-  }, [loadFragBytes, loadIfcBytes, loadObjBytes, ready, recenter]);
+  }, [
+    getGroupTree,
+    isolate,
+    loadFragBytes,
+    loadIfcBytes,
+    loadObjBytes,
+    ready,
+    recenter,
+  ]);
 
   if (!linkError) return null;
 

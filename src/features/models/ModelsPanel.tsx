@@ -4,7 +4,8 @@ import { useViewerContext } from "../viewer/ViewerContext";
 import { CameraPanel } from "../viewer/CameraPanel";
 import { deleteModel as deleteStoredModel } from "../../lib/modelStore";
 import type { LoadedModel } from "../viewer/useViewer";
-import type { GroupNode } from "../viewer/ifcGroups";
+import { elementsOf, findGroups, type GroupNode } from "../viewer/ifcGroups";
+import { linkWithIsolate } from "../../lib/modelLinks";
 
 type Group = { name: string; items: OBC.ModelIdMap };
 type Axis = { key: string; label: string; groups: Group[] };
@@ -111,6 +112,12 @@ function ModelBlock({ model }: { model: LoadedModel }) {
 
   const [axes, setAxes] = useState<Axis[]>([]);
   const [groupTree, setGroupTree] = useState<GroupNode[]>([]);
+  const [groupQuery, setGroupQuery] = useState("");
+  const [copied, setCopied] = useState(false);
+  const matches = groupQuery.trim() ? findGroups(groupTree, groupQuery) : null;
+  // Only a model the link itself loads can be shared: a file opened from
+  // disk exists in this browser alone.
+  const shareable = model.id.startsWith("link-");
   const [open, setOpen] = useState(true);
   const [hidden, setHidden] = useState(false);
   const [hiddenGroups, setHiddenGroups] = useState<Set<string>>(new Set());
@@ -257,17 +264,74 @@ function ModelBlock({ model }: { model: LoadedModel }) {
               <p className="px-6 py-0.5 text-[10px] uppercase tracking-wider text-(--color-text-mute)">
                 Groups
               </p>
-              {groupTree.map((node) => (
-                <GroupRow
-                  key={node.localId}
-                  node={node}
-                  modelId={model.id}
-                  depth={0}
-                  hiddenGroups={hiddenGroups}
-                  onToggle={toggleGroup}
-                  onIsolate={isolateGroup}
+              <div className="flex items-center gap-1 pl-6 pr-2 py-0.5">
+                <input
+                  type="search"
+                  value={groupQuery}
+                  onChange={(e) => {
+                    setGroupQuery(e.target.value);
+                    setCopied(false);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && matches?.length) {
+                      void isolateGroup(groupQuery.trim(), {
+                        [model.id]: new Set(elementsOf(matches)),
+                      });
+                    }
+                  }}
+                  placeholder="Find a code — F.01, KV1.1…"
+                  className="flex-1 min-w-0 px-1.5 py-0.5 text-[11px] rounded bg-(--color-bg) border border-(--color-border) text-(--color-text) placeholder:text-(--color-text-mute) focus:outline-none focus:border-(--color-accent)"
                 />
-              ))}
+                {matches && matches.length > 0 && shareable && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const link = linkWithIsolate(window.location.href, groupQuery);
+                      try {
+                        await navigator.clipboard.writeText(link);
+                        setCopied(true);
+                      } catch {
+                        window.prompt("Link", link);
+                      }
+                    }}
+                    title="Copy a link that opens the model with this isolated"
+                    className="text-[10px] px-1 text-(--color-text-mute) hover:text-(--color-accent) transition"
+                  >
+                    {copied ? "copied" : "link"}
+                  </button>
+                )}
+              </div>
+              {matches ? (
+                matches.length ? (
+                  matches.map((node) => (
+                    <GroupRow
+                      key={node.localId}
+                      node={node}
+                      modelId={model.id}
+                      depth={0}
+                      hiddenGroups={hiddenGroups}
+                      onToggle={toggleGroup}
+                      onIsolate={isolateGroup}
+                    />
+                  ))
+                ) : (
+                  <p className="pl-6 py-0.5 text-[11px] text-(--color-text-mute)">
+                    No group matches.
+                  </p>
+                )
+              ) : (
+                groupTree.map((node) => (
+                  <GroupRow
+                    key={node.localId}
+                    node={node}
+                    modelId={model.id}
+                    depth={0}
+                    hiddenGroups={hiddenGroups}
+                    onToggle={toggleGroup}
+                    onIsolate={isolateGroup}
+                  />
+                ))
+              )}
             </div>
           )}
           {axes.map((axis) =>
